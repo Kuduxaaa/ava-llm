@@ -1,0 +1,8 @@
+{
+  "model_file": "ava_ka_bpe.model",
+  "vocab_size": 32000,
+  "pad_token_id": 0,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "unk_token_id": 3
+}
