@@ -43,6 +43,7 @@ ava/
     clock.py          absolute time, circadian and homeostatic drives
     personality.py    traits as baseline and tau shifts
     appraisal.py      event -> meaning, expectation, prediction error
+    perception.py     prompt -> hidden states -> context, before generation
     relationships.py  per-person bonds
     conditioning.py   FiLM and soft prefix into the model
     engine.py         the loop that ties it together

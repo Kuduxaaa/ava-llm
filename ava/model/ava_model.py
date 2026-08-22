@@ -426,12 +426,19 @@ class AvaForCausalLM(nn.Module):
         attention_mask: torch.Tensor | None = None,
         generation_config: GenerationConfig | None = None,
         streamer=None,
+        world_state=None,
         **kwargs,
     ) -> torch.Tensor:
         """Autoregressive decoding with a real KV / SSM cache.
 
         Works identically for transformer, Mamba and hybrid stacks: the cache
         object holds whatever state each layer type needs.
+
+        ``world_state`` conditions every step on the same internal world. It is
+        passed per step rather than precomputed: the conditioner is a ~50k
+        parameter MLP against a model orders of magnitude larger, and keeping it
+        inside the normal forward path means there is exactly one place where
+        conditioning is applied.
         """
         config = generation_config or GenerationConfig(
             eos_token_id=self.config.eos_token_id,
@@ -481,6 +488,7 @@ class AvaForCausalLM(nn.Module):
                 cache=cache,
                 use_cache=config.use_cache,
                 num_logits_to_keep=1,
+                world_state=world_state,
             )
             cache = output.cache
             next_token = select_next_token(

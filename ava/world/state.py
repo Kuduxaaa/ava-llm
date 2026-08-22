@@ -117,8 +117,12 @@ class WorldState:
         )
 
     def get(self, key: str, index: int = 0) -> float:
-        """A single scalar, for logging and assertions."""
-        return float(self.values[index, schema.index_of(key)])
+        """A single scalar, for logging and assertions.
+
+        Detached: while the appraisal head is training the world carries a graph,
+        and reading a number out of it for a log line should not warn about it.
+        """
+        return float(self.values[index, schema.index_of(key)].detach())
 
     def slice(self, group: str) -> torch.Tensor:
         """The contiguous block for one group, as a view."""
@@ -127,7 +131,7 @@ class WorldState:
         return self.values[:, GROUP_SLICES[group]]
 
     def group(self, name: str, index: int = 0) -> dict[str, float]:
-        block = self.slice(name)[index]
+        block = self.slice(name)[index].detach()
         names = [c.name for c in CHANNELS if c.group == name]
         return dict(zip(names, block.tolist(), strict=True))
 
@@ -161,7 +165,7 @@ class WorldState:
         passing.
         """
         base = torch.tensor(schema.baselines(), device=self.device, dtype=self.dtype)
-        delta = (self.values[index] - base).tolist()
+        delta = (self.values[index].detach() - base).tolist()
         ranked = sorted(
             (
                 (i, d)

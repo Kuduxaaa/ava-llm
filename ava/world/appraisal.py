@@ -45,6 +45,24 @@ REWARD_CONTEXTS: tuple[str, ...] = (
 )
 
 
+def pool_hidden_states(
+    hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Mean over the sequence, ignoring padding.
+
+    Padding has to be excluded rather than averaged in. Left-padded prompts are
+    normal at inference time, and a plain mean drags every short prompt in a
+    batch toward whatever the pad embedding happens to encode -- so the same
+    sentence would be appraised differently depending on who it was batched with.
+    """
+    if attention_mask is None:
+        return hidden_states.mean(dim=1)
+
+    mask = attention_mask[..., None].to(hidden_states.dtype)
+    total = (hidden_states * mask).sum(dim=1)
+    return total / mask.sum(dim=1).clamp_min(1e-6)
+
+
 class Appraisal(ABC):
     """Maps an event plus the current world onto context intensities."""
 
@@ -55,6 +73,7 @@ class Appraisal(ABC):
         hidden_states: torch.Tensor | None = None,
         event: dict[str, float] | None = None,
         relationship: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return ``(batch, NUM_CONTEXT)`` intensities in ``[0, 1]``."""
 
@@ -72,6 +91,7 @@ class DirectAppraisal(Appraisal):
         hidden_states: torch.Tensor | None = None,
         event: dict[str, float] | None = None,
         relationship: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         intensities = torch.zeros(
             state.batch_size, NUM_CONTEXT, device=state.device, dtype=state.dtype
@@ -93,9 +113,19 @@ class DirectAppraisal(Appraisal):
 class NeuralAppraisal(nn.Module, Appraisal):
     """A learned appraisal head over hidden states, the world, and a relationship.
 
-    Deliberately small. Its job is not to understand language -- the language
-    model does that -- but to decide what the understood thing *means* for this
-    particular Ava, right now.
+    Deliberately small: two linear layers over a mean-pooled hidden state. Its
+    job is not to understand language -- the language model does that -- but to
+    decide what the understood thing *means* for this particular Ava, right now.
+
+    It predicts the 23 ``context`` channels and nothing else. Not emotions, not
+    hormones: those are what the coupled dynamics are *for*, and a head that
+    wrote to them directly would be a sentiment classifier wearing the world as
+    a costume. What it emits is closer to "how much rejection was in that", and
+    the graph decides what rejection does to this Ava at this hour.
+
+    Bounded to ``[0, 1]`` by a sigmoid, batched, and differentiable throughout,
+    so gradients reach it either from labelled context targets or from further
+    downstream through the dynamics.
     """
 
     def __init__(
@@ -136,14 +166,21 @@ class NeuralAppraisal(nn.Module, Appraisal):
         hidden_states: torch.Tensor | None = None,
         event: dict[str, float] | None = None,
         relationship: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states is None:
             raise ValueError("NeuralAppraisal needs hidden_states.")
         if hidden_states.ndim == 3:
-            hidden_states = hidden_states.mean(dim=1)
+            hidden_states = pool_hidden_states(hidden_states, attention_mask)
 
-        features = self.from_text(hidden_states) + self.from_world(state.values)
+        if state.batch_size != hidden_states.shape[0]:
+            state = state.expand(hidden_states.shape[0])
+
+        features = self.from_text(hidden_states.to(self.head.weight.dtype))
+        features = features + self.from_world(state.values)
         if self.from_relationship is not None and relationship is not None:
+            if relationship.shape[0] != features.shape[0]:
+                relationship = relationship.expand(features.shape[0], -1)
             features = features + self.from_relationship(relationship)
 
         intensities = torch.sigmoid(self.head(self.trunk(features)))
@@ -154,6 +191,13 @@ class NeuralAppraisal(nn.Module, Appraisal):
             mask = override > 0
             intensities = torch.where(mask, override, intensities)
         return intensities
+
+    def freeze(self) -> None:
+        self.requires_grad_(False)
+        self.eval()
+
+    def unfreeze(self) -> None:
+        self.requires_grad_(True)
 
     __call__ = nn.Module.__call__
 

@@ -127,6 +127,7 @@ class WorldEngine:
         dt: float = 0.0,
         person: str | None = None,
         hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         note: str | None = None,
     ) -> WorldState:
         """Something happened. Appraise it, let it land, advance ``dt`` seconds."""
@@ -145,6 +146,7 @@ class WorldEngine:
             hidden_states=hidden_states,
             event=event,
             relationship=relationship_vector,
+            attention_mask=attention_mask,
         ).to(self.device, self.dtype)
 
         expected = self.expectations.expected

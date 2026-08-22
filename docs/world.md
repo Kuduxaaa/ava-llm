@@ -168,6 +168,69 @@ Two implementations, and the difference is deliberate:
   untrained head on an untrained model produces noise, and no architecture fixes
   that. It is zero-initialised so it invents nothing until it is trained.
 
+The head predicts the 23 **context** channels and nothing else. Not emotions,
+not hormones — those are what the coupled dynamics are *for*, and a head writing
+to them directly would be a sentiment classifier wearing the world as a costume.
+What it emits is closer to *how much rejection was in that*; the graph decides
+what rejection does to this Ava at this hour.
+
+### Automatic appraisal
+
+`AvaPerception` runs the whole chain from token ids:
+
+```python
+from ava.world import AvaPerception, WorldEngine
+
+perception = AvaPerception(model, WorldEngine())      # model frozen by default
+tokens, state = perception.respond(input_ids, attention_mask, person="nika")
+```
+
+```
+input ids
+  -> encode_prompt        Ava's own hidden states, decoder stack only, no LM head
+  -> NeuralAppraisal      masked mean-pool -> 2-layer MLP -> 23 channels, sigmoid
+  -> WorldEngine.observe  expectation, habituation, impulse, coupling, dynamics
+  -> 136-D state
+  -> WorldConditioner     FiLM on the residual stream
+  -> generation
+```
+
+**The ordering is the point.** The appraisal reads the prompt and only the
+prompt, and the world it produces conditions a reply that does not exist yet.
+Appraising afterwards would have Ava reacting to her own words, one turn late.
+
+That costs a second pass over the prompt — one to perceive, one to prefill under
+the resulting conditioning. There is no way around it, since the conditioning
+depends on the appraisal which depends on the prompt, but the perception pass
+skips the LM head.
+
+Pooling is **masked**. A plain mean drags a short prompt toward whatever the pad
+embedding encodes, so the same sentence would be appraised differently depending
+on what it was batched with.
+
+`perceive(event={...})` still works and still wins: an explicit channel
+overrides the learned guess for that channel without turning appraisal off.
+
+### Training the head
+
+`AvaPerception` freezes the language model and leaves the appraisal head *and*
+the conditioner trainable — the conditioner lives inside `AvaForCausalLM` but is
+the other half of this wiring, and freezing it would leave the world computed
+with no path by which it could come to matter.
+
+```python
+optimizer = torch.optim.AdamW(perception.trainable_parameters(), lr=1e-4)
+
+# against labelled context, without running the dynamics
+loss = F.binary_cross_entropy(perception.appraise(ids, mask), targets)
+
+# or end to end through the engine
+state = perception.perceive(ids, mask, detach=False)   # keeps the graph
+```
+
+`detach=True` is the inference default; otherwise a long conversation
+accumulates one autograd graph per turn and frees none of them.
+
 ### Expectation and prediction error
 
 The engine keeps a decaying average of what usually happens. Prediction error is

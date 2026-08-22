@@ -24,12 +24,14 @@ from .appraisal import (
     DirectAppraisal,
     ExpectationTracker,
     NeuralAppraisal,
+    pool_hidden_states,
 )
 from .clock import WorldClock, circadian_offset
 from .conditioning import WorldConditioner, WorldSummary, apply_film
 from .coupling import EDGES, build_coupling_matrix, edges_into, edges_out_of
 from .dynamics import WorldDynamics
 from .engine import EngineConfig, WorldEngine
+from .perception import AvaPerception, encode_prompt
 from .personality import ARCHETYPES, Personality
 from .relationships import RELATIONSHIP_SIZE, Relationship, RelationshipBook
 from .schema import CHANNELS, GROUP_ORDER, NUM_CHANNELS, Channel, index_of, keys
@@ -45,6 +47,7 @@ __all__ = [
     "NUM_CONTEXT",
     "RELATIONSHIP_SIZE",
     "Appraisal",
+    "AvaPerception",
     "Channel",
     "DirectAppraisal",
     "EngineConfig",
@@ -64,6 +67,8 @@ __all__ = [
     "circadian_offset",
     "edges_into",
     "edges_out_of",
+    "encode_prompt",
     "index_of",
     "keys",
+    "pool_hidden_states",
 ]

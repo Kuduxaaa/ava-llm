@@ -77,7 +77,8 @@ input → embed → [MambaBlock × 10] → [DecoderLayer × 2] → RMSNorm → l
 - Time constants from two minutes to a month, asymmetric rise and fall
 - Circadian rhythm, sleep pressure, hunger, rumination, isolation — running
   whether or not anyone is talking
-- Appraisal conditioned on the world, so identical words are not identical events
+- Automatic appraisal: the prompt's own hidden states become context channels,
+  before the reply is written and never seeing it
 - Personality as a standing bias; per-person bonds with their own clocks
 - Reaches the model by modulating the residual stream, not by narration
 
