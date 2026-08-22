@@ -21,35 +21,15 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-import unicodedata
 from pathlib import Path
+
+from ava.data import is_low_quality
 
 #: Rough bytes of UTF-8 per token, by script. Latin text is about one byte per
 #: character and a token is a few characters; Georgian, Cyrillic, Greek and the
 #: Indic scripts are two or three bytes per character, so the same token budget
 #: costs several times the disk. Used only for a progress estimate.
 BYTES_PER_TOKEN = {"latin": 4.5, "two_byte": 8.0, "three_byte": 11.0}
-
-
-def is_low_quality(text: str, min_length: int, max_symbol_ratio: float) -> bool:
-    """Cheap, language-neutral quality filters.
-
-    Every rule here is about *structure*, not vocabulary: run-length, symbol
-    density and replacement characters flag boilerplate and mojibake in any
-    script, whereas a stopword list would only work for the language it was
-    written for.
-    """
-    if len(text) < min_length:
-        return True
-    if "�" in text:  # decoding already failed upstream
-        return True
-    if any(character * 10 in text for character in ".-_=*#~/\\|"):
-        return True
-
-    symbols = sum(
-        1 for character in text if unicodedata.category(character).startswith(("P", "S"))
-    )
-    return symbols / len(text) > max_symbol_ratio
 
 
 def estimate_total(dataset: str, config: str | None, split: str) -> int | None:

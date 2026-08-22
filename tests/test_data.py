@@ -81,6 +81,46 @@ def test_missing_metadata_is_an_explicit_error(tmp_path, tokenizer):
         load_packed(tmp_path / "c.bin")
 
 
+# --- source filtering ---
+
+
+def test_quality_filters_are_language_neutral():
+    """Structural rules only: they must not favour the script they were written in."""
+    from ava.data import is_low_quality
+
+    georgian = "დღეს კარგი ამბავი მაქვს " * 20
+    english = "the quick brown fox jumps over the lazy dog " * 20
+
+    assert not is_low_quality(georgian)
+    assert not is_low_quality(english)
+
+
+def test_quality_filters_reject_what_they_should():
+    from ava.data import is_low_quality
+
+    assert is_low_quality("too short")
+    assert is_low_quality("a" * 300 + "�")  # mojibake
+    assert is_low_quality("=" * 300)  # a run of separators
+    assert is_low_quality("!@#$%^&*() " * 40)  # mostly symbols
+
+
+def test_min_length_counts_characters_not_bytes():
+    """Georgian is three bytes per character; a byte threshold would keep junk."""
+    from ava.data import is_low_quality
+
+    text = "დღე" * 30  # 90 characters, 270 bytes
+    assert is_low_quality(text, min_length=200)
+    assert not is_low_quality(text, min_length=50)
+
+
+def test_write_sample_stops_at_the_limit(tmp_path):
+    from ava.data import write_sample
+
+    written = write_sample((f"document {i}" for i in range(1000)), tmp_path / "s.txt", 40)
+    assert written == 40
+    assert len((tmp_path / "s.txt").read_text(encoding="utf-8").splitlines()) == 40
+
+
 # --- packed dataset ---
 
 
