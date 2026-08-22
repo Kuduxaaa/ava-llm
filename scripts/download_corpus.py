@@ -6,7 +6,14 @@ Dataset- and language-agnostic: point it at any dataset that has a text column.
     python scripts/download_corpus.py --dataset HuggingFaceFW/fineweb --config sample-10BT
     python scripts/download_corpus.py --dataset wikimedia/wikipedia --config 20231101.fr
 
-Gated datasets need `hf auth login` first.
+Several sources can be pooled into one corpus with --append, which is usually
+necessary for a language that does not have a single large clean source:
+
+    python scripts/download_corpus.py --dataset HuggingFaceFW/fineweb-2         --config kat_Geor --output data/corpus.txt
+    python scripts/download_corpus.py --dataset wikimedia/wikipedia         --config 20231101.ka --output data/corpus.txt --append
+
+Gated datasets need `hf auth login` first. On a hosted notebook that means an
+HF token in the secrets store, not an interactive login.
 """
 
 from __future__ import annotations
@@ -42,12 +49,16 @@ def download(args: argparse.Namespace) -> None:
     from datasets import load_dataset
 
     output = args.output
-    if output.exists() and not args.force:
+    if output.exists() and not (args.force or args.append):
         size_mb = output.stat().st_size / 1e6
-        print(f"{output} already exists ({size_mb:.0f} MB). Pass --force to overwrite.")
+        print(
+            f"{output} already exists ({size_mb:.0f} MB). Pass --force to replace "
+            "it or --append to add to it."
+        )
         return
 
     output.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if args.append and output.exists() else "w"
     print(f"Streaming {args.dataset}" + (f" [{args.config}]" if args.config else ""))
 
     dataset = load_dataset(
@@ -58,7 +69,7 @@ def download(args: argparse.Namespace) -> None:
     )
 
     kept = skipped = 0
-    with open(output, "w", encoding="utf-8") as handle:
+    with open(output, mode, encoding="utf-8") as handle:
         for record in dataset:
             text = (record.get(args.text_column) or "").strip()
             text = " ".join(text.split())  # collapse newlines: one doc per line
@@ -94,7 +105,13 @@ def main() -> None:
     parser.add_argument("--max-docs", type=int, default=None)
     parser.add_argument("--min-length", type=int, default=200)
     parser.add_argument("--max-symbol-ratio", type=float, default=0.3)
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force", action="store_true", help="Replace the output.")
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Add to the output instead of replacing it. For a low-resource "
+        "language, one source is rarely enough and several have to be pooled.",
+    )
     args = parser.parse_args()
 
     try:
