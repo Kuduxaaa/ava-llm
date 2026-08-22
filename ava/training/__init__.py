@@ -14,7 +14,9 @@ from .optimizer import (
 from .trainer import (
     Trainer,
     TrainingConfig,
+    check_device_is_supported,
     find_latest_checkpoint,
+    has_hardware_bf16,
     train_model,
     unwrap_model,
 )
@@ -24,6 +26,7 @@ __all__ = [
     "ThroughputMeter",
     "Trainer",
     "TrainingConfig",
+    "check_device_is_supported",
     "compute_perplexity",
     "create_hybrid_optimizer",
     "create_optimizer",
@@ -32,6 +35,7 @@ __all__ = [
     "evaluate_model",
     "find_latest_checkpoint",
     "flops_per_token",
+    "has_hardware_bf16",
     "train_model",
     "unwrap_model",
 ]

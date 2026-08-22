@@ -25,7 +25,12 @@ from torch.utils.data import DataLoader
 from ava import AvaConfig, AvaForCausalLM, GenerationConfig
 from ava.data import PackedDataset, collate_packed, iter_text_file, pack_corpus
 from ava.tokenizer import AvaTokenizer
-from ava.training import Trainer, TrainingConfig
+from ava.training import (
+    Trainer,
+    TrainingConfig,
+    check_device_is_supported,
+    has_hardware_bf16,
+)
 from ava.world import AvaPerception, WorldEngine
 
 WORDS = [
@@ -124,8 +129,23 @@ def main() -> int:
     print(f"device    {device}")
     if device.type == "cuda":
         properties = torch.cuda.get_device_properties(device)
-        print(f"gpu       {properties.name}  {properties.total_memory / 1e9:.1f} GB")
+        major, minor = torch.cuda.get_device_capability(device)
+        print(
+            f"gpu       {properties.name}  {properties.total_memory / 1e9:.1f} GB  "
+            f"sm_{major}{minor}"
+        )
+        print(
+            f"precision {'bf16' if has_hardware_bf16(device) else 'fp16 + GradScaler'}"
+            f"   (hardware bf16 needs sm_80+)"
+        )
     print(f"workspace {workspace}\n")
+
+    # Before anything else: does this build have kernels for this card at all?
+    # Otherwise every later stage fails with "no kernel image is available",
+    # which names neither the GPU nor the fix.
+    check("gpu is supported by this build", lambda: check_device_is_supported(device))
+    if check.failures:
+        return report(check, workspace, args.keep)
 
     # --- corpus ---
     corpus = workspace / "corpus.txt"

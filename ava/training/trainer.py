@@ -53,22 +53,87 @@ def find_latest_checkpoint(directory: str | os.PathLike) -> str | None:
     return os.path.join(directory, max(steps)[1])
 
 
+def has_hardware_bf16(device: torch.device) -> bool:
+    """Real bf16 units, not emulation. Requires Ampere (sm_80) or newer.
+
+    ``torch.cuda.is_bf16_supported()`` defaults to ``including_emulation=True``
+    and so answers yes on cards that have no bf16 hardware at all -- a Pascal
+    P100 included. Believing it is expensive on a Turing T4, where the choice is
+    between emulated bf16 and fp16 that actually reaches the tensor cores.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    major, _ = torch.cuda.get_device_capability(index)
+    return major >= 8
+
+
+def check_device_is_supported(device: torch.device) -> None:
+    """Fail early if this PyTorch build has no kernels for this GPU.
+
+    Otherwise the first matmul raises ``no kernel image is available for
+    execution on the device``, which names neither the GPU nor the fix. Hosted
+    notebooks hand out older cards that current builds have dropped, so this is
+    a real and confusing way to lose a session.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(index)
+    arch_list = torch.cuda.get_arch_list()
+    if not arch_list:
+        return
+
+    def parse(prefix: str) -> list[tuple[int, int]]:
+        found = []
+        for name in arch_list:
+            if not name.startswith(prefix):
+                continue
+            digits = name[len(prefix) :].split("+", 1)[0]
+            if digits.isdigit() and len(digits) >= 2:
+                found.append((int(digits[:-1]), int(digits[-1])))
+        return found
+
+    # Cubins are binary compatible upward across *minor* versions within the
+    # same major architecture, so sm_86 kernels run on an sm_89 card. They are
+    # not compatible across majors, which is why a P100 (sm_60) finds nothing in
+    # a build that starts at sm_70. PTX at or below this capability can be JIT
+    # compiled forward regardless.
+    if any(m == major and n <= minor for m, n in parse("sm_")):
+        return
+    if any((m, n) <= (major, minor) for m, n in parse("compute_")):
+        return
+
+    name = torch.cuda.get_device_name(index)
+    raise RuntimeError(
+        f"{name} is compute capability sm_{major}{minor}, and this PyTorch build "
+        f"only has kernels for {', '.join(arch_list)}. Nothing will run on it. "
+        "Choose a different accelerator, or install a build that supports this "
+        "card."
+    )
+
+
 def resolve_precision(
     device: torch.device, requested: str
 ) -> tuple[torch.dtype | None, bool]:
     """Pick an autocast dtype and say whether a gradient scaler is needed.
 
-    bf16 is the default because it has the same exponent range as fp32: no loss
-    scaling, no inf/NaN skipped steps, no scaler state to checkpoint. fp16 is
-    only worth reaching for on pre-Ampere hardware that has no bf16 units.
+    bf16 is preferred where the hardware has it, because it shares fp32's
+    exponent range: no loss scaling, no inf/NaN skipped steps, no scaler state to
+    checkpoint. Pre-Ampere cards get fp16 with a scaler, which is slower to
+    babysit but is what actually reaches their tensor cores.
     """
     if requested == "fp32" or device.type == "cpu":
         return None, False
-    if requested == "bf16" or requested == "auto":
-        if device.type == "cuda" and torch.cuda.is_bf16_supported():
+    if requested in ("bf16", "auto"):
+        if has_hardware_bf16(device):
             return torch.bfloat16, False
         if requested == "bf16":
-            raise RuntimeError("bf16 was requested but this device does not support it.")
+            raise RuntimeError(
+                "bf16 was requested but this device has no bf16 hardware "
+                "(it needs sm_80 or newer). Use precision='auto' for fp16."
+            )
         return torch.float16, True  # auto -> fall back
     if requested == "fp16":
         return torch.float16, True
@@ -143,6 +208,8 @@ class Trainer:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.train_loader = train_loader
         self.val_loader = val_loader
+
+        check_device_is_supported(self.device)
 
         torch.manual_seed(self.config.seed)
         if self.device.type == "cuda":

@@ -14,17 +14,34 @@ numbers, and verify the GPU you were actually given in the first cell.
 | | P100 | T4 ×2 |
 |---|---|---|
 | Compute capability | sm_60 | sm_75 |
-| bf16 | no | no |
-| fp16 tensor cores | **no** | yes |
+| Runs at all on Kaggle's PyTorch | **no** | yes |
+| bf16 hardware | no | no |
+| fp16 tensor cores | no | yes |
 | Memory | 16 GB | 15 GB each |
 
-**Pick T4 ×2.** The P100 has no tensor cores at all, so fp16 buys it very little;
-a T4 is several times faster in practice for this workload, and there are two of
-them.
+**You must select T4 ×2. The P100 does not work.** Kaggle's PyTorch build ships
+kernels for `sm_70` and up, and the P100 is `sm_60`. Cubins are binary
+compatible upward across *minor* versions only, not across majors, so there is
+nothing for it to run:
 
-Since neither supports bf16, `precision="auto"` resolves to **fp16 with a
-gradient scaler**. That path is tested and works, but it is the one where loss
-scaling matters, so watch for `grad` going to `nan` in the log.
+```
+Tesla P100-PCIE-16GB with CUDA capability sm_60 is not compatible with the
+current PyTorch installation. The current PyTorch install supports CUDA
+capabilities sm_70 sm_75 sm_80 sm_86 sm_90 sm_100 sm_120.
+```
+
+That warning is easy to scroll past, and the failure it produces arrives later
+as `CUDA error: no kernel image is available for execution on the device` —
+which names neither the GPU nor the fix. `preflight.py` checks for it before
+anything else and says so plainly.
+
+Neither card has bf16 hardware, so `precision="auto"` resolves to **fp16 with a
+gradient scaler**. Note that `torch.cuda.is_bf16_supported()` cannot be used to
+decide this: it defaults to `including_emulation=True` and answers yes on a
+P100. Ava checks the compute capability directly, because emulated bf16 on a T4
+would cost it its tensor cores.
+
+fp16 is the path where loss scaling matters, so watch for `grad` reaching `nan`.
 
 ### Rough budget
 
@@ -113,12 +130,14 @@ previous run of notebook B.
 
 ```python
 import torch
-print(torch.cuda.device_count(), "GPU(s)")
+print(torch.cuda.device_count(), "GPU(s)  build supports:", torch.cuda.get_arch_list())
 for i in range(torch.cuda.device_count()):
     p = torch.cuda.get_device_properties(i)
-    print(f"  {p.name}  {p.total_memory/1e9:.1f} GB  sm_{p.major}{p.minor}  "
-          f"bf16={torch.cuda.is_bf16_supported()}")
+    print(f"  {p.name}  {p.total_memory/1e9:.1f} GB  sm_{p.major}{p.minor}")
 ```
+
+If you see `sm_60`, stop and switch the accelerator to **T4 ×2** before doing
+anything else.
 
 ```python
 !git clone https://github.com/Kuduxaaa/ava-llm.git /kaggle/working/ava
