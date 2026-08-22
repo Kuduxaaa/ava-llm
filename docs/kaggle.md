@@ -91,10 +91,14 @@ One minute, and it fails loudly if anything in the environment is wrong. Do not
 skip it — this is the cheapest place to find out.
 
 ```python
-# ~10B tokens is roughly 40 GB of text; start smaller and see how the disk holds up.
+!df -h /kaggle/working | tail -1
+
+# Aim for ~5B tokens on the first run. The packed stream is two bytes per token,
+# so 5B is a 10 GB output and Kaggle caps what a version can save. That is still
+# ~38 tokens per parameter for a 130M model, comfortably past Chinchilla.
 !python scripts/download_corpus.py \
     --dataset HuggingFaceFW/fineweb --config sample-10BT \
-    --max-docs 8000000 \
+    --max-docs 6000000 \
     --output /kaggle/working/data/corpus.txt
 ```
 
@@ -167,13 +171,42 @@ else:
     print("starting from scratch")
 ```
 
-Then train. `--resume auto` picks up whatever was just copied, and starts fresh
-if there was nothing:
+Before the eleven-hour run, spend fifteen minutes measuring. Batch size and
+learning rate are cheap to get wrong and expensive to discover late:
 
 ```python
+!cd /kaggle/working/ava && python scripts/pretrain.py \
+    --tokens {DATA} --preset 130m \
+    --block-size 512 --batch-size 16 --grad-accum 6 \
+    --max-steps 100000 --lr 6e-4 --schedule wsd \
+    --checkpoint-dir /tmp/calibrate --max-hours 0.25
+```
+
+Then check three things:
+
+```python
+!nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+```
+
+- **memory** around 85% of the card, not over. Over does not error, it crawls.
+- **tok/s** — the number the whole plan rests on. Compare it against the estimate
+  before committing hours to it.
+- **grad** — on fp16 specifically, `nan` means the scaler is losing. Drop `--lr`
+  to 4e-4 and try again.
+
+Throw `/tmp/calibrate` away afterwards; it exists to be thrown away.
+
+Then train for real. `--resume auto` picks up whatever was just copied, and
+starts fresh if there was nothing:
+
+```python
+TOKENIZER = os.path.dirname(
+    glob.glob("/kaggle/input/*/data/tokenizer/tokenizer.model")[0]
+)
+
 !cd /kaggle/working/ava && torchrun --nproc_per_node=2 scripts/pretrain.py \
     --tokens {DATA} \
-    --tokenizer-dir /kaggle/input/*/data/tokenizer \
+    --tokenizer-dir {TOKENIZER} \
     --preset 130m \
     --block-size 512 \
     --batch-size 16 \
@@ -192,6 +225,10 @@ if there was nothing:
 `--max-hours 11` stops cleanly and saves before Kaggle pulls the session. Being
 killed loses everything since the last periodic save and leaves no final
 checkpoint; stopping an hour early loses an hour.
+
+If `torchrun` or `--compile` refuses to start, drop them in that order and note
+the single-GPU throughput. A session that runs beats a faster one that will not,
+and `torch.compile` under DDP is the combination most likely to complain.
 
 Single GPU is the same command without `torchrun`:
 
