@@ -261,6 +261,48 @@ def test_only_the_newest_step_checkpoints_are_kept(tmp_path, loader):
     assert len(saved) == 2
 
 
+def test_finds_the_newest_checkpoint(tmp_path):
+    """Chained sessions resume by lookup, not by the operator retyping a path."""
+    from ava.training import find_latest_checkpoint
+
+    assert find_latest_checkpoint(tmp_path) is None
+    for step in (5, 120, 40):
+        (tmp_path / f"ava_step_{step}.pt").touch()
+    (tmp_path / "ava_best.pt").touch()
+    (tmp_path / "notes.txt").touch()
+
+    assert find_latest_checkpoint(tmp_path).endswith("ava_step_120.pt")
+    assert find_latest_checkpoint(tmp_path / "nope") is None
+
+
+def test_a_time_budget_stops_cleanly_and_leaves_a_checkpoint(tmp_path, loader):
+    """Being killed at a session limit loses everything since the last save.
+
+    Stopping just short of it loses the difference.
+    """
+    import os
+
+    from ava.training.trainer import Trainer
+
+    trainer = Trainer(
+        AvaForCausalLM(tiny()),
+        loader,
+        config=TrainingConfig(
+            num_epochs=100,
+            max_steps=10_000,
+            precision="fp32",
+            checkpoint_dir=str(tmp_path),
+            max_hours=1e-9,
+            log_interval=1000,
+        ),
+    )
+    trainer.train()
+
+    assert trainer.global_step < 10_000
+    assert not trainer.finished
+    assert any(f.startswith("ava_step_") for f in os.listdir(tmp_path))
+
+
 def test_max_steps_overrides_epochs(tmp_path, loader):
     from ava.training.trainer import Trainer
 

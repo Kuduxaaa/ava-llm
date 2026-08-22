@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from ava import AvaConfig, AvaForCausalLM
 from ava.data import PackedDataset, collate_packed
 from ava.tokenizer import AvaTokenizer
-from ava.training import TrainingConfig, train_model
+from ava.training import TrainingConfig, find_latest_checkpoint, train_model
 from ava.utils import cleanup_distributed, model_summary, setup_distributed, wrap_ddp
 
 
@@ -73,7 +73,19 @@ def main() -> None:
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--val-fraction", type=float, default=0.005)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Checkpoint path, or 'auto' to continue from the newest one in "
+        "--checkpoint-dir. 'auto' on an empty directory starts fresh.",
+    )
+    parser.add_argument(
+        "--max-hours",
+        type=float,
+        default=None,
+        help="Stop cleanly after this many hours, saving first. Set it below the "
+        "session limit of a hosted notebook.",
+    )
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
@@ -112,8 +124,19 @@ def main() -> None:
         checkpoint_dir=str(args.checkpoint_dir),
         save_every=args.save_every,
         eval_every=args.eval_every,
+        max_hours=args.max_hours,
         seed=args.seed,
     )
+
+    resume_from = args.resume
+    if resume_from == "auto":
+        resume_from = find_latest_checkpoint(args.checkpoint_dir)
+        if is_main:
+            print(
+                f"resuming from {resume_from}"
+                if resume_from
+                else "no checkpoint found; starting from scratch"
+            )
 
     trained, _ = train_model(
         model,
@@ -121,7 +144,7 @@ def main() -> None:
         val_loader,
         device=device,
         training_config=training_config,
-        resume_from=args.resume,
+        resume_from=resume_from,
     )
 
     if is_main:

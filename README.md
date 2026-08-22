@@ -227,6 +227,7 @@ nothing else notices.
 - [Configuration](docs/configuration.md) — every `AvaConfig` field
 - [Training](docs/training.md) — precision, optimizers, schedules, scaling, memory
 - [Pretraining runbook](docs/pretraining.md) — measured throughput, cloud costs, the actual sequence
+- [Kaggle](docs/kaggle.md) — chained 12-hour sessions, fp16, resume
 - [Data](docs/data.md) — packing, chat data, collators
 - [Tokenizer](docs/tokenizer.md) — training one for any language
 - [Generation](docs/generation.md) — sampling, caching, LoRA, quantisation

@@ -29,6 +29,30 @@ def unwrap_model(model: nn.Module) -> nn.Module:
             return model
 
 
+def find_latest_checkpoint(directory: str | os.PathLike) -> str | None:
+    """The newest step checkpoint in ``directory``, or ``None`` if there is none.
+
+    Sessions on hosted notebooks are capped at a few hours, so a real run is a
+    chain of them. Making "carry on from wherever you got to" a lookup rather
+    than something the operator retypes each time removes the failure that costs
+    the most: silently restarting from step zero.
+    """
+    directory = str(directory)
+    if not os.path.isdir(directory):
+        return None
+
+    steps = []
+    for name in os.listdir(directory):
+        if name.startswith("ava_step_") and name.endswith(".pt"):
+            try:
+                steps.append((int(name[len("ava_step_") : -len(".pt")]), name))
+            except ValueError:
+                continue
+    if not steps:
+        return None
+    return os.path.join(directory, max(steps)[1])
+
+
 def resolve_precision(
     device: torch.device, requested: str
 ) -> tuple[torch.dtype | None, bool]:
@@ -86,6 +110,13 @@ class TrainingConfig:
     eval_every: int | None = None
     log_interval: int = 10
     seed: int = 1337
+
+    max_hours: float | None = None
+    """Stop cleanly after this long, saving first.
+
+    Hosted notebooks are killed at a fixed wall-clock limit. Being killed loses
+    everything since the last periodic save *and* leaves no final checkpoint;
+    stopping ten minutes early loses ten minutes."""
 
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -160,6 +191,7 @@ class Trainer:
 
         self.global_step = 0
         self.start_epoch = 0
+        self.finished = False
         self.best_val_loss = float("inf")
         self.history: list[dict[str, Any]] = []
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
@@ -230,7 +262,9 @@ class Trainer:
         window_batches = 0
         start_time = time.time()
         stop = False
+        out_of_time = False
         is_step_boundary = True
+        deadline = None if cfg.max_hours is None else start_time + cfg.max_hours * 3600.0
 
         for epoch in range(self.start_epoch, cfg.num_epochs):
             sampler = getattr(self.train_loader, "sampler", None)
@@ -267,6 +301,15 @@ class Trainer:
                 if cfg.save_every and self.global_step % cfg.save_every == 0:
                     self.save_checkpoint(f"step_{self.global_step}", epoch)
 
+                if deadline is not None and time.time() >= deadline:
+                    self.log(
+                        f"reached the {cfg.max_hours:g}h budget at step "
+                        f"{self.global_step}; saving and stopping"
+                    )
+                    self.save_checkpoint(f"step_{self.global_step}", epoch)
+                    stop = out_of_time = True
+                    break
+
                 if self.global_step >= self.num_training_steps:
                     stop = True
                     break
@@ -287,7 +330,16 @@ class Trainer:
                 break
 
         elapsed = time.time() - start_time
-        self.log(f"Done in {elapsed / 60:.1f} min | {meter.tokens:,} tokens seen")
+        self.log(
+            f"Done in {elapsed / 60:.1f} min | {meter.tokens:,} tokens seen"
+            + (
+                f" | stopped early at step {self.global_step}/{self.num_training_steps},"
+                " resume to continue"
+                if out_of_time
+                else ""
+            )
+        )
+        self.finished = not out_of_time
         return unwrap_model(self.model), self.history
 
     def _forward_backward(self, batch: dict, accum: int, sync: bool) -> torch.Tensor:

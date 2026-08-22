@@ -11,7 +11,13 @@ from .optimizer import (
     create_optimizer,
     create_scheduler,
 )
-from .trainer import Trainer, TrainingConfig, train_model, unwrap_model
+from .trainer import (
+    Trainer,
+    TrainingConfig,
+    find_latest_checkpoint,
+    train_model,
+    unwrap_model,
+)
 
 __all__ = [
     "Muon",
@@ -24,6 +30,7 @@ __all__ = [
     "create_scheduler",
     "device_peak_flops",
     "evaluate_model",
+    "find_latest_checkpoint",
     "flops_per_token",
     "train_model",
     "unwrap_model",

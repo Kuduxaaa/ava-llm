@@ -6,6 +6,7 @@
 | [configuration.md](configuration.md) | Every `AvaConfig` field, presets, sizing a model |
 | [training.md](training.md) | Precision, optimizers, schedules, memory, DDP, resume |
 | [pretraining.md](pretraining.md) | Runbook for the first real job: measured costs, sequence, gotchas |
+| [kaggle.md](kaggle.md) | Chained sessions on Kaggle: no bf16, 12-hour cap, resume |
 | [data.md](data.md) | Corpus packing, chat data, collators |
 | [tokenizer.md](tokenizer.md) | Training a tokenizer for any language |
 | [generation.md](generation.md) | Sampling, caching, LoRA, quantisation |
