@@ -351,6 +351,77 @@ def test_without_max_steps_epochs_still_bound_the_run(tmp_path):
     assert trainer.global_step == 6  # 2 steps per pass, three passes
 
 
+def test_a_failed_hub_upload_does_not_stop_training(tmp_path, loader):
+    """Losing an upload is a setback; stopping the run over it is the larger one."""
+    from ava.training.trainer import Trainer
+
+    trainer = Trainer(
+        AvaForCausalLM(tiny()),
+        loader,
+        config=TrainingConfig(
+            num_epochs=1,
+            max_steps=2,
+            precision="fp32",
+            checkpoint_dir=str(tmp_path),
+            save_every=1,
+            hub_repo="nobody/does-not-exist-and-has-no-token",
+            hub_every=1,
+            log_interval=1000,
+        ),
+    )
+    trainer.train()
+    assert trainer.global_step == 2
+
+
+def test_uploads_are_less_frequent_than_saves_by_default(tmp_path, loader):
+    """A checkpoint with optimizer state is gigabytes; the upload is not free."""
+    from unittest.mock import patch as mock_patch
+
+    from ava.training.trainer import Trainer
+
+    trainer = Trainer(
+        AvaForCausalLM(tiny()),
+        loader,
+        config=TrainingConfig(
+            num_epochs=1,
+            max_steps=8,
+            precision="fp32",
+            checkpoint_dir=str(tmp_path),
+            save_every=1,
+            hub_repo="someone/ava",
+            log_interval=1000,
+        ),
+    )
+    with mock_patch.object(Trainer, "_upload_checkpoint") as upload:
+        trainer.train()
+
+    saves = len([f for f in __import__("os").listdir(tmp_path) if f.startswith("ava_")])
+    assert 0 < upload.call_count < 8, upload.call_count
+    assert saves >= 1
+
+
+def test_no_hub_repo_means_no_upload(tmp_path, loader):
+    from unittest.mock import patch as mock_patch
+
+    from ava.training.trainer import Trainer
+
+    trainer = Trainer(
+        AvaForCausalLM(tiny()),
+        loader,
+        config=TrainingConfig(
+            num_epochs=1,
+            max_steps=2,
+            precision="fp32",
+            checkpoint_dir=str(tmp_path),
+            save_every=1,
+            log_interval=1000,
+        ),
+    )
+    with mock_patch.object(Trainer, "_upload_checkpoint") as upload:
+        trainer.train()
+    assert upload.call_count == 0
+
+
 def test_max_steps_overrides_epochs(tmp_path, loader):
     from ava.training.trainer import Trainer
 

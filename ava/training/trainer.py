@@ -180,6 +180,17 @@ class TrainingConfig:
     log_interval: int = 10
     seed: int = 1337
 
+    hub_repo: str | None = None
+    """Mirror checkpoints to a Hugging Face repo as training runs.
+
+    A hosted notebook's disk does not survive the session. Losing the machine
+    before saving loses the run, and the only copy that is safe is the one that
+    already left the machine."""
+    hub_every: int | None = None
+    """Steps between uploads. Defaults to four times ``save_every``, because a
+    checkpoint with optimizer state is gigabytes and the upload is not free."""
+    hub_private: bool = True
+
     max_hours: float | None = None
     """Stop cleanly after this long, saving first.
 
@@ -316,6 +327,8 @@ class Trainer:
         tokens_per_step = self._tokens_per_optimizer_step()
         meter = ThroughputMeter(self.model_config, self.device)
 
+        if cfg.hub_repo:
+            self.log(f"mirroring checkpoints to {cfg.hub_repo}")
         self.log(
             f"steps={self.num_training_steps} lr={cfg.learning_rate:g} "
             f"schedule={cfg.lr_schedule} optim={cfg.optimizer} "
@@ -393,7 +406,10 @@ class Trainer:
                         f"reached the {cfg.max_hours:g}h budget at step "
                         f"{self.global_step}; saving and stopping"
                     )
-                    self.save_checkpoint(f"step_{self.global_step}", epoch)
+                    path = self.save_checkpoint(f"step_{self.global_step}", epoch)
+                    # The final one always goes up, whatever the interval says.
+                    if path:
+                        self._upload_checkpoint(path)
                     stop = out_of_time = True
                     break
 
@@ -560,6 +576,32 @@ class Trainer:
 
     # --- checkpointing ---
 
+    def _upload_checkpoint(self, path: str) -> None:
+        """Mirror one checkpoint to the Hub, under a fixed name.
+
+        Always the same filename, so the repo holds the newest and nothing else:
+        the point is a copy that survives the machine, not a history. A failure
+        here is logged and ignored -- losing an upload is a setback, and
+        stopping training over it would be the larger one.
+        """
+        repo = self.config.hub_repo
+        if not repo:
+            return
+        try:
+            from huggingface_hub import HfApi
+
+            api = HfApi()
+            api.create_repo(repo, private=self.config.hub_private, exist_ok=True)
+            api.upload_file(
+                path_or_fileobj=path,
+                path_in_repo="checkpoint.pt",
+                repo_id=repo,
+                commit_message=f"step {self.global_step}",
+            )
+            self.log(f"  mirrored step {self.global_step} to {repo}")
+        except Exception as exc:
+            self.log(f"  hub upload failed ({type(exc).__name__}: {exc}); continuing")
+
     def save_checkpoint(self, tag: str, epoch: int, prune: bool = True) -> str | None:
         if not self.is_main:
             return None
@@ -588,6 +630,10 @@ class Trainer:
 
         if prune:
             self._prune_checkpoints()
+
+        every = self.config.hub_every or ((self.config.save_every or 0) * 4)
+        if self.config.hub_repo and every and self.global_step % every == 0:
+            self._upload_checkpoint(path)
         return path
 
     def _prune_checkpoints(self) -> None:

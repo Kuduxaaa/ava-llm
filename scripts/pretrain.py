@@ -80,6 +80,19 @@ def main() -> None:
         "--checkpoint-dir. 'auto' on an empty directory starts fresh.",
     )
     parser.add_argument(
+        "--hub-repo",
+        default=None,
+        help="Mirror checkpoints to this Hugging Face repo, e.g. 'user/ava-130m'. "
+        "A hosted notebook's disk does not survive the session; this copy does. "
+        "Needs HF_TOKEN in the environment.",
+    )
+    parser.add_argument(
+        "--hub-every",
+        type=int,
+        default=None,
+        help="Steps between uploads. Defaults to 4x --save-every.",
+    )
+    parser.add_argument(
         "--max-hours",
         type=float,
         default=None,
@@ -125,6 +138,8 @@ def main() -> None:
         save_every=args.save_every,
         eval_every=args.eval_every,
         max_hours=args.max_hours,
+        hub_repo=args.hub_repo,
+        hub_every=args.hub_every,
         seed=args.seed,
     )
 
