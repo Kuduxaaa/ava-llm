@@ -173,3 +173,14 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 TODO.md
+# --- Ava ---
+checkpoints/
+runs/
+wandb/
+models/*.pt
+models/*.safetensors
+data/*.txt
+data/tokens/
+data/**/*.bin
+!data/.gitkeep
+!models/.gitkeep

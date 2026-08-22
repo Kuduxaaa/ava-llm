@@ -1,12 +1,30 @@
-from .metrics import compute_perplexity, evaluate_model
-from .optimizer import create_optimizer, create_scheduler
-from .trainer import TrainingConfig, train_model
+from .metrics import (
+    ThroughputMeter,
+    compute_perplexity,
+    device_peak_flops,
+    evaluate_model,
+    flops_per_token,
+)
+from .optimizer import (
+    Muon,
+    create_hybrid_optimizer,
+    create_optimizer,
+    create_scheduler,
+)
+from .trainer import Trainer, TrainingConfig, train_model, unwrap_model
 
 __all__ = [
-    "train_model",
+    "Muon",
+    "ThroughputMeter",
+    "Trainer",
     "TrainingConfig",
-    "evaluate_model",
     "compute_perplexity",
+    "create_hybrid_optimizer",
     "create_optimizer",
     "create_scheduler",
+    "device_peak_flops",
+    "evaluate_model",
+    "flops_per_token",
+    "train_model",
+    "unwrap_model",
 ]

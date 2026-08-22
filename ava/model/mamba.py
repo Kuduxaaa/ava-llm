@@ -1,155 +1,333 @@
+"""Selective state-space (Mamba) blocks in pure PyTorch.
+
+Two things separate this from a textbook implementation:
+
+**Bounded memory.** The naive selective scan materialises an
+``(batch, seq_len, inner_dim, d_state)`` tensor -- for a 1B hybrid at 8k context
+that is tens of gigabytes, which is why a "linear-time" model can OOM where a
+quadratic transformer does not. The scan here is *chunked*: it runs a parallel
+prefix scan inside a window of ``ssm_chunk_size`` steps and carries a single
+``(batch, inner_dim, d_state)`` state across windows, gradient-checkpointing
+each window. The ``d_state`` dimension exists only *inside* that checkpoint --
+see :func:`_ssm_window` for why that placement, rather than the loop itself, is
+what actually bounds the memory.
+
+**Real recurrent decoding.** The block returns and accepts an explicit SSM state
+and a depthwise-conv lookback window, so generating token *t+1* costs the same
+as generating token 1. Without that, an SSM has no incremental mode at all and
+generation silently degrades to "predict from a one-token context".
+"""
+
+from __future__ import annotations
+
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as grad_checkpoint
+from torch.utils.checkpoint import checkpoint
 
+from ..config import AvaConfig
+from .cache import MambaLayerCache
 from .normalization import AvaRMSNorm
 
 
-def _associative_scan(gates, values):
-    """Parallel prefix scan (Hillis-Steele) for linear recurrence.
+def _prefix_scan(
+    gates: torch.Tensor, values: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Hillis-Steele inclusive scan of ``h[t] = gates[t] * h[t-1] + values[t]``.
 
-    Computes h[t] = gates[t] * h[t-1] + values[t], h[-1] = 0.
-    O(log L) sequential steps — optimal for GPU parallelism.
+    ``O(log L)`` sequential steps over dimension 1 instead of ``O(L)``, which is
+    the difference between a scan the GPU can saturate and a Python loop.
+    Returns the scanned values *and* the cumulative gate products -- the latter
+    is what folds in a state carried from a previous chunk.
     """
-    L = gates.shape[1]
-    num_steps = int(math.ceil(math.log2(max(L, 2))))
+    length = gates.shape[1]
+    stride = 1
+    while stride < length:
+        shifted_gates = gates[:, : length - stride]
+        shifted_values = values[:, : length - stride]
+        values = torch.cat(
+            [
+                values[:, :stride],
+                gates[:, stride:] * shifted_values + values[:, stride:],
+            ],
+            dim=1,
+        )
+        gates = torch.cat([gates[:, :stride], gates[:, stride:] * shifted_gates], dim=1)
+        stride *= 2
+    return values, gates
 
-    for i in range(num_steps):
-        stride = 2 ** i
-        if stride >= L:
-            break
-        new_g = gates[:, stride:] * gates[:, :L - stride]
-        new_v = gates[:, stride:] * values[:, :L - stride] + values[:, stride:]
-        gates = torch.cat([gates[:, :stride], new_g], dim=1)
-        values = torch.cat([values[:, :stride], new_v], dim=1)
 
-    return values
+def _scan_chunk(
+    a_bar: torch.Tensor, b_x: torch.Tensor, state: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Scan one chunk given an incoming ``state``; return all states and the last.
 
+    ``a_bar`` and ``b_x`` are ``(batch, chunk, inner_dim, d_state)`` and
+    ``state`` is ``(batch, inner_dim, d_state)``.
 
-def _cpu_sequential_scan(x, dt, A, B, C, d_state):
-    """Per-step sequential scan optimized for CPU cache locality.
-
-    Computes exp/discretize inline per timestep with small tensor ops.
+    The carried state is ``clone()``d rather than returned as a view. A view of
+    the last timestep keeps the whole ``(batch, chunk, inner_dim, d_state)``
+    slab alive -- which would pin gigabytes inside a decoding cache long after
+    the chunk itself is finished with.
     """
-    batch, seq_len, inner_dim = x.shape
-    h = torch.zeros(batch, inner_dim, d_state, device=x.device, dtype=x.dtype)
-    outputs = torch.empty(batch, seq_len, inner_dim, device=x.device, dtype=x.dtype)
+    local, cumulative_gates = _prefix_scan(a_bar, b_x)
+    states = local + cumulative_gates * state.unsqueeze(1)
+    return states, states[:, -1].clone()
 
-    for t in range(seq_len):
-        dt_t = dt[:, t, :].unsqueeze(-1)         # (B, D, 1)
-        A_bar = torch.exp(dt_t * A.unsqueeze(0))  # (B, D, N)
-        B_bar = dt_t * B[:, t, :].unsqueeze(1)    # (B, D, N)
-        x_t = x[:, t, :].unsqueeze(-1)            # (B, D, 1)
 
-        h = A_bar * h + B_bar * x_t               # (B, D, N)
-        outputs[:, t] = (h * C[:, t, :].unsqueeze(1)).sum(dim=-1)
+def _ssm_window(
+    dt: torch.Tensor,
+    a_matrix: torch.Tensor,
+    b_matrix: torch.Tensor,
+    c_matrix: torch.Tensor,
+    x: torch.Tensor,
+    state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Discretise, scan and project one window, in a single checkpointable unit.
 
-    return outputs
+    Everything of size ``(batch, chunk, inner_dim, d_state)`` -- the discretised
+    ``A``, the input term, and the per-step states -- is born and dies inside
+    this function. That placement is the whole point: tensors created *outside*
+    a checkpoint are saved as its inputs, so computing ``a_bar`` in the caller
+    would retain one such slab per window and make total memory scale with
+    ``seq_len`` again, exactly what chunking is meant to avoid.
+
+    What crosses the boundary is only ``O(chunk * inner_dim)`` and
+    ``O(chunk * d_state)``, smaller by a factor of ``d_state``.
+    """
+    dt = dt.unsqueeze(-1)  # (b, chunk, inner, 1)
+    a_bar = torch.exp(dt * a_matrix)  # (b, chunk, inner, state)
+    b_x = dt * b_matrix.unsqueeze(2) * x.unsqueeze(-1)
+
+    states, last_state = _scan_chunk(a_bar, b_x, state)
+    y = (states * c_matrix.unsqueeze(2)).sum(-1)  # (b, chunk, inner)
+    return y, last_state
 
 
 class SelectiveSSM(nn.Module):
-    """Selective State Space Model with adaptive scan strategy.
+    """The S6 layer: input-dependent ``dt``, ``B`` and ``C``."""
 
-    GPU: parallel prefix scan with gradient checkpointing — O(log L) depth
-    CPU: per-step sequential scan — cache-friendly O(L) with small tensors
-    """
-
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.inner_dim = d_model * expand
-
-        self.in_proj = nn.Linear(d_model, self.inner_dim * 2, bias=False)
-        self.conv1d = nn.Conv1d(
-            self.inner_dim, self.inner_dim,
-            kernel_size=d_conv, padding=d_conv - 1,
-            groups=self.inner_dim, bias=True,
-        )
-        self.x_proj = nn.Linear(self.inner_dim, d_state * 2 + 1, bias=False)
-        self.dt_proj = nn.Linear(1, self.inner_dim, bias=True)
-
-        A = torch.arange(1, d_state + 1, dtype=torch.float32)
-        self.A_log = nn.Parameter(torch.log(A.unsqueeze(0).expand(self.inner_dim, -1)))
-        self.D = nn.Parameter(torch.ones(self.inner_dim))
-        self.out_proj = nn.Linear(self.inner_dim, d_model, bias=False)
-
-    def forward(self, x):
-        batch, seq_len, _ = x.shape
-
-        # Input projection: x branch + gate z
-        xz = self.in_proj(x)
-        x_branch, z = xz.chunk(2, dim=-1)
-
-        # Causal depthwise conv1d + SiLU
-        x_branch = F.silu(
-            self.conv1d(x_branch.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
-        )
-
-        # SSM parameters (fully vectorized)
-        ssm_params = self.x_proj(x_branch)
-        B = ssm_params[..., :self.d_state]
-        C = ssm_params[..., self.d_state:self.d_state * 2]
-        dt = F.softplus(self.dt_proj(ssm_params[..., -1:]))
-        A = -torch.exp(self.A_log)
-
-        if x.is_cuda:
-            # GPU path: vectorized pre-compute + parallel scan + grad checkpoint
-            dt_4d = dt.unsqueeze(-1)
-            A_bar = torch.exp(dt_4d * A.unsqueeze(0).unsqueeze(0))  # (B, L, D, N)
-            B_x = dt_4d * B.unsqueeze(2) * x_branch.unsqueeze(-1)   # (B, L, D, N)
-            h = grad_checkpoint(_associative_scan, A_bar, B_x, use_reentrant=False)
-            y = (h * C.unsqueeze(2)).sum(dim=-1)
-        else:
-            # CPU path: per-step sequential (cache-friendly)
-            y = _cpu_sequential_scan(x_branch, dt, A, B, C, self.d_state)
-
-        # Skip connection + gating
-        y = y + self.D.unsqueeze(0).unsqueeze(0) * x_branch
-        y = y * F.silu(z)
-        return self.out_proj(y)
-
-
-class MambaBlock(nn.Module):
-    """Mamba block: Pre-LN + SelectiveSSM + residual."""
-
-    def __init__(self, config):
+    def __init__(self, config: AvaConfig) -> None:
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_size
-        self.is_mamba = True
+        self.d_model = config.hidden_size
+        self.d_state = config.d_state
+        self.d_conv = config.d_conv
+        self.expand = config.expand
+        self.inner_dim = config.ssm_inner_dim
+        self.dt_rank = config.ssm_dt_rank
+        self.chunk_size = config.ssm_effective_chunk_size
 
-        self.norm = AvaRMSNorm(config.hidden_size, epsilon=config.rms_norm_eps)
-        self.ssm = SelectiveSSM(
-            d_model=config.hidden_size,
-            d_state=config.d_state,
-            d_conv=config.d_conv,
-            expand=config.expand,
+        self.in_proj = nn.Linear(self.d_model, self.inner_dim * 2, bias=False)
+        self.conv1d = nn.Conv1d(
+            self.inner_dim,
+            self.inner_dim,
+            kernel_size=self.d_conv,
+            padding=self.d_conv - 1,
+            groups=self.inner_dim,
+            bias=True,
         )
+        self.x_proj = nn.Linear(self.inner_dim, self.dt_rank + 2 * self.d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.inner_dim, bias=True)
+        self.out_proj = nn.Linear(self.inner_dim, self.d_model, bias=False)
+
+        # S4D-real initialisation: A = -diag(1..N), stored in log space so the
+        # sign can never flip during training and the system stays stable.
+        a = torch.arange(1, self.d_state + 1, dtype=torch.float32)
+        self.A_log = nn.Parameter(torch.log(a).expand(self.inner_dim, -1).contiguous())
+        self.D = nn.Parameter(torch.ones(self.inner_dim))
+
+        self._init_dt_bias()
+
+    def _init_dt_bias(self, dt_min: float = 1e-3, dt_max: float = 1e-1) -> None:
+        """Bias ``dt`` so ``softplus(bias)`` is log-uniform over ``[dt_min, dt_max]``.
+
+        Without this the timescales all start identical and the model spends the
+        first few thousand steps just learning to differentiate them.
+        """
+        dt_init_std = self.dt_rank**-0.5
+        nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+
+        dt = torch.exp(
+            torch.rand(self.inner_dim) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp_min(1e-4)
+        # Inverse of softplus.
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True
+        self.dt_proj.weight._no_reinit = True
+
+    # --- parallel (training / prefill) path ---
 
     def forward(
         self,
-        hidden_states,
-        attention_mask=None,
-        position_ids=None,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        rotary_emb=None,
-    ):
-        residual = hidden_states
-        hidden_states = self.norm(hidden_states)
-        hidden_states = self.ssm(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states: torch.Tensor,
+        cache: MambaLayerCache | None = None,
+    ) -> torch.Tensor:
+        if (
+            cache is not None
+            and cache.ssm_state is not None
+            and hidden_states.shape[1] == 1
+        ):
+            return self.step(hidden_states, cache)
 
-        outputs = (hidden_states,)
-        if use_cache:
-            outputs += (None,)
-        if output_attentions:
-            outputs += (None,)
-        return outputs
+        batch, seq_len, _ = hidden_states.shape
+
+        x_branch, gate = self.in_proj(hidden_states).chunk(2, dim=-1)
+        x_branch = x_branch.transpose(1, 2)  # (b, inner, seq)
+
+        if cache is not None:
+            # Keep the last d_conv-1 inputs so the next single-token step sees
+            # the same receptive field it would have seen in the parallel pass.
+            lookback = self.d_conv - 1
+            window = x_branch[:, :, -lookback:].detach()
+            cache.conv_state = F.pad(window, (lookback - window.shape[-1], 0))
+
+        x_branch = self.conv1d(x_branch)[:, :, :seq_len].transpose(1, 2)
+        x_branch = F.silu(x_branch)
+
+        dt, b_matrix, c_matrix = self._project_ssm_params(x_branch)
+        a_matrix = -torch.exp(self.A_log.float())
+
+        state = (
+            cache.ssm_state
+            if cache is not None and cache.ssm_state is not None
+            else x_branch.new_zeros(batch, self.inner_dim, self.d_state)
+        )
+        y, state = self._chunked_scan(x_branch, dt, a_matrix, b_matrix, c_matrix, state)
+
+        if cache is not None:
+            cache.ssm_state = state.detach()
+
+        y = y + self.D.float() * x_branch
+        y = y.to(gate.dtype) * F.silu(gate)
+        return self.out_proj(y)
+
+    def _project_ssm_params(
+        self, x_branch: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        params = self.x_proj(x_branch)
+        dt_low_rank, b_matrix, c_matrix = torch.split(
+            params, [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+        dt = F.softplus(self.dt_proj(dt_low_rank))
+        return dt.float(), b_matrix.float(), c_matrix.float()
+
+    def _chunked_scan(
+        self,
+        x_branch: torch.Tensor,
+        dt: torch.Tensor,
+        a_matrix: torch.Tensor,
+        b_matrix: torch.Tensor,
+        c_matrix: torch.Tensor,
+        state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the selective scan in fixed-size windows.
+
+        Retained activation memory is ``O(batch * seq_len * inner_dim)`` rather
+        than ``O(batch * seq_len * inner_dim * d_state)``: the ``d_state``
+        dimension only ever exists inside :func:`_ssm_window`, which is
+        gradient-checkpointed and so recomputes it in the backward pass.
+
+        ``config.ssm_chunk_size`` then trades the transient peak against the
+        number of kernel launches; it does not change the result.
+        """
+        seq_len = x_branch.shape[1]
+        x_float = x_branch.float()
+        checkpointing = self.training and torch.is_grad_enabled()
+        outputs = []
+
+        for start in range(0, seq_len, self.chunk_size):
+            stop = min(start + self.chunk_size, seq_len)
+            window = (
+                dt[:, start:stop],
+                a_matrix,
+                b_matrix[:, start:stop],
+                c_matrix[:, start:stop],
+                x_float[:, start:stop],
+                state,
+            )
+            if checkpointing:
+                y, state = checkpoint(_ssm_window, *window, use_reentrant=False)
+            else:
+                y, state = _ssm_window(*window)
+            outputs.append(y)
+
+        return torch.cat(outputs, dim=1), state
+
+    # --- recurrent (decode) path ---
+
+    def step(self, hidden_states: torch.Tensor, cache: MambaLayerCache) -> torch.Tensor:
+        """Advance one token using the cached state. Constant cost per token."""
+        x_branch, gate = self.in_proj(hidden_states).chunk(2, dim=-1)
+        x_branch = x_branch.transpose(1, 2)  # (b, inner, 1)
+
+        conv_window = torch.cat([cache.conv_state, x_branch], dim=-1)
+        cache.conv_state = conv_window[:, :, 1:]
+
+        x_conv = (conv_window * self.conv1d.weight.squeeze(1)).sum(-1)
+        x_conv = F.silu(x_conv + self.conv1d.bias).unsqueeze(1)  # (b, 1, inner)
+
+        dt, b_matrix, c_matrix = self._project_ssm_params(x_conv)
+        a_matrix = -torch.exp(self.A_log.float())
+
+        dt = dt.squeeze(1).unsqueeze(-1)  # (b, inner, 1)
+        a_bar = torch.exp(dt * a_matrix)
+        b_x = (
+            dt * b_matrix.squeeze(1).unsqueeze(1) * x_conv.float().squeeze(1).unsqueeze(-1)
+        )
+
+        cache.ssm_state = a_bar * cache.ssm_state + b_x
+        y = (cache.ssm_state * c_matrix.squeeze(1).unsqueeze(1)).sum(-1).unsqueeze(1)
+
+        y = y + self.D.float() * x_conv.float()
+        y = y.to(gate.dtype) * F.silu(gate)
+        return self.out_proj(y)
+
+    def allocate_cache(self, batch: int, device, dtype) -> MambaLayerCache:
+        return MambaLayerCache(
+            ssm_state=torch.zeros(
+                batch, self.inner_dim, self.d_state, device=device, dtype=torch.float32
+            ),
+            conv_state=torch.zeros(
+                batch, self.inner_dim, self.d_conv - 1, device=device, dtype=dtype
+            ),
+        )
+
+    def extra_repr(self) -> str:
+        return (
+            f"d_model={self.d_model}, d_state={self.d_state}, "
+            f"d_conv={self.d_conv}, expand={self.expand}, "
+            f"dt_rank={self.dt_rank}, chunk={self.chunk_size}"
+        )
+
+
+class MambaBlock(nn.Module):
+    """Pre-norm residual wrapper around :class:`SelectiveSSM`."""
+
+    is_mamba = True
+
+    def __init__(self, config: AvaConfig, layer_idx: int = 0) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.norm = AvaRMSNorm(config.hidden_size, epsilon=config.rms_norm_eps)
+        self.ssm = SelectiveSSM(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        layer_cache: MambaLayerCache | None = None,
+        output_attentions: bool = False,
+    ) -> tuple[torch.Tensor, None]:
+        """Signature mirrors :class:`AvaDecoderLayer` positionally so that a
+        hybrid stack can call either layer type the same way -- including the
+        positional-only call that ``torch.utils.checkpoint`` makes."""
+        residual = hidden_states
+        hidden_states = self.ssm(self.norm(hidden_states), cache=layer_cache)
+        return residual + hidden_states, None

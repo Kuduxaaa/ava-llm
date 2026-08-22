@@ -1,462 +1,547 @@
+"""The Ava decoder stack and its causal-LM head."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
-from .attention import AvaAttention
+from ..config import AvaConfig
+from .attention import AvaAttention, build_causal_mask
+from .cache import AvaCache
 from .embeddings import AvaRotaryEmbedding
+from .generation import GenerationConfig, select_next_token
 from .mamba import MambaBlock
 from .mlp import AvaMLP
 from .normalization import AvaRMSNorm
 
 
+@dataclass
+class BaseModelOutput:
+    last_hidden_state: torch.Tensor
+    cache: AvaCache | None = None
+    hidden_states: tuple[torch.Tensor, ...] | None = None
+    attentions: tuple[torch.Tensor, ...] | None = None
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+
+@dataclass
+class CausalLMOutput:
+    logits: torch.Tensor
+    loss: torch.Tensor | None = None
+    z_loss: torch.Tensor | None = None
+    cache: AvaCache | None = None
+    hidden_states: tuple[torch.Tensor, ...] | None = None
+    attentions: tuple[torch.Tensor, ...] | None = None
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
+
 class AvaDecoderLayer(nn.Module):
-    def __init__(self, config):
+    """Pre-norm attention + gated MLP."""
+
+    is_mamba = False
+
+    def __init__(self, config: AvaConfig, layer_idx: int = 0) -> None:
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.self_attn = AvaAttention(config)
-
+        self.layer_idx = layer_idx
+        self.self_attn = AvaAttention(config, layer_idx=layer_idx)
         self.mlp = AvaMLP(config)
-        self.input_layernorm = AvaRMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps
-        )
-
+        self.input_layernorm = AvaRMSNorm(config.hidden_size, epsilon=config.rms_norm_eps)
         self.post_attention_layernorm = AvaRMSNorm(
             config.hidden_size, epsilon=config.rms_norm_eps
         )
 
     def forward(
         self,
-        hidden_states,
-        attention_mask=None,
-        position_ids=None,
-        past_key_value=None,
-        output_attentions=False,
-        use_cache=False,
-        rotary_emb=None,
-    ):
-
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        layer_cache=None,
+        output_attentions: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-
-        attn_outputs = self.self_attn(
-            hidden_states=hidden_states,
+        attn_output, attn_weights = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings=position_embeddings,
             attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
+            layer_cache=layer_cache,
             output_attentions=output_attentions,
-            use_cache=use_cache,
-            rotary_emb=rotary_emb,
         )
-
-        hidden_states = attn_outputs[0]
-        hidden_states = residual + hidden_states
+        hidden_states = residual + attn_output
 
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-
-        outputs = (hidden_states,)
-
-        if use_cache:
-            outputs += (attn_outputs[1],)
-
-        if output_attentions:
-            outputs += (attn_outputs[2],)
-
-        return outputs
+        hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, attn_weights
 
 
 class AvaModel(nn.Module):
-    def __init__(self, config):
+    """Embedding table, the layer stack, and the final norm."""
+
+    def __init__(self, config: AvaConfig) -> None:
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_size
+        self.gradient_checkpointing = config.gradient_checkpointing
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
-        arch = getattr(config, "architecture_type", "transformer")
-        self.architecture_type = arch
-        num_layers = config.num_hidden_layers
-        num_attn = getattr(config, "num_attention_layers", num_layers)
-
-        if arch == "transformer":
-            self.layers = nn.ModuleList(
-                [AvaDecoderLayer(config) for _ in range(num_layers)]
-            )
-        elif arch == "mamba":
-            self.layers = nn.ModuleList(
-                [MambaBlock(config) for _ in range(num_layers)]
-            )
-        elif arch == "hybrid":
-            num_mamba = num_layers - num_attn
-            layers = []
-            for i in range(num_layers):
-                if i < num_mamba:
-                    layers.append(MambaBlock(config))
-                else:
-                    layers.append(AvaDecoderLayer(config))
-            self.layers = nn.ModuleList(layers)
-        else:
-            raise ValueError(f"Unknown architecture_type: {arch}")
-
-        self.has_attention = arch in ("transformer", "hybrid")
+        self.layers = nn.ModuleList(
+            AvaDecoderLayer(config, i) if kind == "attention" else MambaBlock(config, i)
+            for i, kind in enumerate(config.layer_types())
+        )
         self.norm = AvaRMSNorm(config.hidden_size, epsilon=config.rms_norm_eps)
 
-        if self.has_attention:
-            self.rotary_emb = AvaRotaryEmbedding(
+        self.rotary_emb = (
+            AvaRotaryEmbedding(
                 config.head_dim,
                 max_position_embeddings=config.max_position_embeddings,
                 base=config.rope_theta,
+                scaling=config.rope_scaling,
             )
-        else:
-            self.rotary_emb = None
+            if config.has_attention
+            else None
+        )
 
-        self.apply(self._init_weights)
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
 
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-
-            if module.bias is not None:
-                module.bias.data.zero_()
-
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
+    def set_input_embeddings(self, value: nn.Embedding) -> None:
+        self.embed_tokens = value
 
     def forward(
         self,
-        input_ids,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-        batch_size, seq_length = (
-            input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
-        )
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
-
-        if position_ids is None:
-            position_ids = torch.arange(
-                seq_length, dtype=torch.long, device=device
-            ).unsqueeze(0)
-
-        past_length = 0
-        if past_key_values is not None:
-            # Find a non-None past_key_value to get past_length
-            for pkv in past_key_values:
-                if pkv is not None:
-                    past_length = pkv[0].shape[2]
-                    break
-            position_ids = position_ids[:, past_length:]
-
-        # Build attention mask only when padding is present.
-        # When None, SDPA uses is_causal=True (FlashAttention fast path).
-        expanded_attn_mask = None
-        if self.has_attention and attention_mask is not None:
-            causal_mask = torch.triu(
-                torch.full(
-                    (seq_length, seq_length), -float("inf"), device=device,
-                ),
-                diagonal=1,
-            )
-            expanded_attn_mask = (
-                1.0 - attention_mask.unsqueeze(1).unsqueeze(2)
-            ) * torch.finfo(torch.float32).min
-            expanded_attn_mask = expanded_attn_mask + causal_mask.unsqueeze(0).unsqueeze(0)
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        cache: AvaCache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+    ) -> BaseModelOutput:
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Pass exactly one of input_ids or inputs_embeds.")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        batch, seq_len, _ = inputs_embeds.shape
+        device = inputs_embeds.device
 
-        hidden_states = inputs_embeds
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-        next_past_key_values = () if use_cache else None
+        if use_cache and cache is None:
+            cache = AvaCache.from_config(self.config)
+        past_length = cache.seen_tokens if cache is not None else 0
 
-        for i, layer in enumerate(self.layers):
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            past_key_value = past_key_values[i] if past_key_values is not None else None
-
-            is_mamba = getattr(layer, "is_mamba", False)
-            layer_outputs = layer(
-                hidden_states,
-                attention_mask=expanded_attn_mask if not is_mamba else None,
-                position_ids=position_ids if not is_mamba else None,
-                past_key_value=past_key_value if not is_mamba else None,
-                output_attentions=output_attentions if not is_mamba else False,
-                use_cache=use_cache,
-                rotary_emb=self.rotary_emb if not is_mamba else None,
+        if position_ids is None:
+            position_ids = (
+                torch.arange(past_length, past_length + seq_len, device=device)
+                .unsqueeze(0)
+                .expand(batch, -1)
             )
 
-            hidden_states = layer_outputs[0]
+        position_embeddings = None
+        attention_bias = None
+        if self.config.has_attention:
+            position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
+            attention_bias = build_causal_mask(
+                attention_mask, batch, seq_len, past_length, inputs_embeds.dtype, device
+            )
 
-            if use_cache:
-                next_past_key_values += (layer_outputs[1],)
+        hidden_states = inputs_embeds
+        all_hidden_states: list[torch.Tensor] = []
+        all_attentions: list[torch.Tensor] = []
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[2],)
+        for index, layer in enumerate(self.layers):
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
+
+            layer_cache = cache[index] if cache is not None else None
+
+            if self.gradient_checkpointing and self.training:
+                hidden_states, attn_weights = torch.utils.checkpoint.checkpoint(
+                    layer.__call__,
+                    hidden_states,
+                    position_embeddings,
+                    attention_bias,
+                    layer_cache,
+                    output_attentions,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states, attn_weights = layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_bias,
+                    layer_cache=layer_cache,
+                    output_attentions=output_attentions,
+                )
+
+            if output_attentions and attn_weights is not None:
+                all_attentions.append(attn_weights)
 
         hidden_states = self.norm(hidden_states)
-
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            all_hidden_states.append(hidden_states)
 
-        return {
-            "last_hidden_state": hidden_states,
-            "past_key_values": next_past_key_values,
-            "hidden_states": all_hidden_states,
-            "attentions": all_self_attns,
-        }
+        if cache is not None:
+            cache.advance(seq_len)
+
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            cache=cache,
+            hidden_states=tuple(all_hidden_states) if output_hidden_states else None,
+            attentions=tuple(all_attentions) if output_attentions else None,
+        )
 
 
 class AvaForCausalLM(nn.Module):
-    def __init__(self, config):
+    """Ava with a language-modelling head."""
+
+    def __init__(self, config: AvaConfig) -> None:
         super().__init__()
         self.config = config
         self.model = AvaModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.apply(self._init_weights)
+        self._scale_residual_projections()
 
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
 
-    def _init_weights(self, module):
+    # --- initialisation ---
+
+    def _init_weights(self, module: nn.Module) -> None:
         std = self.config.initializer_range
+
+        def keep(tensor) -> bool:
+            # Layers that carry a purpose-built init (Mamba's dt schedule) opt
+            # out rather than being flattened back to a plain normal.
+            return getattr(tensor, "_no_reinit", False)
+
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-
-            if module.bias is not None:
-                module.bias.data.zero_()
-
+            if not keep(module.weight):
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None and not keep(module.bias):
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+
+        # nn.Conv1d is deliberately left at PyTorch's fan-in default. The only
+        # convolution here is Mamba's depthwise kernel, whose fan-in is d_conv
+        # (4), so the default standard deviation is ~0.29. Overwriting it with
+        # initializer_range (0.02) attenuates the SSM branch by more than an
+        # order of magnitude and leaves the residual stream an identity path --
+        # which with tied embeddings degenerates into "predict the current
+        # token" and starts training well above ln(vocab_size).
+
+    def _scale_residual_projections(self) -> None:
+        """Shrink the projections that write into the residual stream.
+
+        Every layer adds to the same stream, so without a ``1/sqrt(2N)`` factor
+        the stream's variance grows linearly in depth and deep models start with
+        activations far outside the range the norms were tuned for.
+        """
+        if not self.config.scaled_residual_init:
+            return
+        scale = (2 * self.config.num_hidden_layers) ** -0.5
+        for name, param in self.named_parameters():
+            if name.endswith(("o_proj.weight", "down_proj.weight", "out_proj.weight")):
+                with torch.no_grad():
+                    param.mul_(scale)
+
+    # --- embedding plumbing ---
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    def get_output_embeddings(self) -> nn.Linear:
+        return self.lm_head
+
+    def resize_token_embeddings(self, new_vocab_size: int) -> None:
+        """Grow or shrink the vocabulary, preserving the weights that survive.
+
+        New rows are drawn from the same distribution as the original init --
+        re-creating the layer with PyTorch's default would give them a standard
+        deviation of 1.0 and swamp the pretrained rows.
+        """
+        old = self.model.embed_tokens
+        if new_vocab_size == old.num_embeddings:
+            return
+
+        new = nn.Embedding(new_vocab_size, self.config.hidden_size).to(
+            old.weight.device, old.weight.dtype
+        )
+        nn.init.normal_(new.weight, mean=0.0, std=self.config.initializer_range)
+        keep = min(new_vocab_size, old.num_embeddings)
+        with torch.no_grad():
+            new.weight[:keep] = old.weight[:keep]
+        self.model.embed_tokens = new
+
+        head = nn.Linear(self.config.hidden_size, new_vocab_size, bias=False).to(
+            old.weight.device, old.weight.dtype
+        )
+        if self.config.tie_word_embeddings:
+            head.weight = new.weight
+        else:
+            nn.init.normal_(head.weight, mean=0.0, std=self.config.initializer_range)
+            with torch.no_grad():
+                head.weight[:keep] = self.lm_head.weight[:keep]
+        self.lm_head = head
+        self.config.vocab_size = new_vocab_size
+
+    def gradient_checkpointing_enable(self, enable: bool = True) -> None:
+        self.model.gradient_checkpointing = enable
+        self.config.gradient_checkpointing = enable
+
+    def num_parameters(self, trainable_only: bool = False) -> int:
+        seen: set[int] = set()
+        total = 0
+        for param in self.parameters():
+            if id(param) in seen:  # tied weights must not be counted twice
+                continue
+            seen.add(id(param))
+            if trainable_only and not param.requires_grad:
+                continue
+            total += param.numel()
+        return total
+
+    # --- forward ---
 
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        labels=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        cache: AvaCache | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        num_logits_to_keep: int = 0,
+    ) -> CausalLMOutput:
+        """``num_logits_to_keep=1`` computes logits for the last position only.
+
+        During decoding the other positions are thrown away anyway, and the head
+        is a ``hidden_size x vocab_size`` matmul -- skipping it is the single
+        biggest saving in the decode loop for a small model with a large vocab.
+        """
         output = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            cache=cache,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
         )
 
-        hidden_states = output["last_hidden_state"]
+        hidden_states = output.last_hidden_state
+        if num_logits_to_keep > 0:
+            hidden_states = hidden_states[:, -num_logits_to_keep:]
         logits = self.lm_head(hidden_states)
 
-        loss = None
+        loss = z_loss = None
         if labels is not None:
+            loss, z_loss = self._compute_loss(logits, labels)
 
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+        return CausalLMOutput(
+            logits=logits,
+            loss=loss,
+            z_loss=z_loss,
+            cache=output.cache,
+            hidden_states=output.hidden_states,
+            attentions=output.attentions,
+        )
 
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
+    def _compute_loss(
+        self, logits: torch.Tensor, labels: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        shift_logits = logits[:, :-1].reshape(-1, logits.shape[-1]).float()
+        shift_labels = labels[:, 1:].reshape(-1).to(shift_logits.device)
 
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+        loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
 
-        return {
-            "loss": loss,
-            "logits": logits,
-            "past_key_values": output.get("past_key_values", None),
-            "hidden_states": output.get("hidden_states", None),
-            "attentions": output.get("attentions", None),
-        }
+        z_loss = None
+        coefficient = self.config.z_loss_coef
+        if coefficient > 0:
+            # Keeps logsumexp near zero so the softmax denominator cannot drift;
+            # this is what stops late-run loss spikes in bf16 training.
+            valid = shift_labels != -100
+            if valid.any():
+                log_z = torch.logsumexp(shift_logits[valid], dim=-1)
+                z_loss = coefficient * log_z.square().mean()
+                loss = loss + z_loss
+        return loss, z_loss
 
-    def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, **kwargs
-    ):
-        input_shape = input_ids.shape
-        if past_key_values is not None:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
+    # --- generation ---
 
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values is not None:
-                position_ids = position_ids[:, -1].unsqueeze(-1)
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-            "past_key_values": past_key_values,
-            "use_cache": kwargs.get("use_cache", True),
-        }
-
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(
         self,
-        input_ids,
-        attention_mask=None,
-        max_length=None,
-        temperature=1.0,
-        top_k=50,
-        top_p=0.9,
-        repetition_penalty=1.0,
-        do_sample=True,
-        num_return_sequences=1,
-        pad_token_id=None,
-        eos_token_id=None,
-        use_cache=True,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        generation_config: GenerationConfig | None = None,
         streamer=None,
-        early_stopping=True,
-    ):
-        """
-        Improved generate method with streamer support and better caching
-        """
-        pad_token_id = (
-            pad_token_id if pad_token_id is not None else self.config.pad_token_id
-        )
-        eos_token_id = (
-            eos_token_id if eos_token_id is not None else self.config.eos_token_id
-        )
-        max_length = (
-            max_length
-            if max_length is not None
-            else self.config.max_position_embeddings
-        )
-        batch_size = input_ids.shape[0]
+        **kwargs,
+    ) -> torch.Tensor:
+        """Autoregressive decoding with a real KV / SSM cache.
 
+        Works identically for transformer, Mamba and hybrid stacks: the cache
+        object holds whatever state each layer type needs.
+        """
+        config = generation_config or GenerationConfig(
+            eos_token_id=self.config.eos_token_id,
+            pad_token_id=self.config.pad_token_id,
+        )
+        for key, value in kwargs.items():
+            if not hasattr(config, key):
+                raise TypeError(f"Unknown generation argument {key!r}")
+            setattr(config, key, value)
+        config.__post_init__()
+
+        if config.eos_token_id is None:
+            config.eos_token_id = self.config.eos_token_id
+            config.__post_init__()
+        pad_token_id = (
+            config.pad_token_id
+            if config.pad_token_id is not None
+            else self.config.pad_token_id
+        )
+
+        was_training = self.training
+        self.eval()
+
+        device = input_ids.device
+        batch, prompt_length = input_ids.shape
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
 
-        input_ids_seq_length = input_ids.shape[-1]
-        generated_tokens = input_ids.clone()
-        cached_position_ids = (
-            torch.arange(input_ids_seq_length, device=input_ids.device)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        past_key_values = None
+        generator = None
+        if config.seed is not None:
+            generator = torch.Generator(device=device).manual_seed(config.seed)
 
-        unfinished_sequences = torch.ones(
-            batch_size, dtype=torch.long, device=input_ids.device
-        )
-        self.eval()
+        stop_ids = torch.tensor(config.stop_token_ids, device=device)
+        unfinished = torch.ones(batch, dtype=torch.bool, device=device)
+        generated = input_ids
+        cache = AvaCache.from_config(self.config) if config.use_cache else None
 
-        for current_length in range(input_ids_seq_length, max_length):
-            if past_key_values is not None:
-                inputs = generated_tokens[:, -1].unsqueeze(-1)
-            else:
-                inputs = generated_tokens
+        # Absolute positions, correct even when the batch is left-padded.
+        position_ids = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
+        step_input = input_ids
 
-            if past_key_values is not None:
-                position_ids = cached_position_ids[:, -1].unsqueeze(-1) + 1
-                cached_position_ids = torch.cat(
-                    [cached_position_ids, position_ids], dim=-1
-                )
-            else:
-                position_ids = cached_position_ids
-
-            if attention_mask is not None and past_key_values is not None:
-                attention_mask = torch.cat(
-                    [attention_mask, unfinished_sequences.unsqueeze(-1)], dim=-1
-                )
-
-            model_inputs = self.prepare_inputs_for_generation(
-                inputs,
-                past_key_values=past_key_values,
+        for _ in range(config.budget(prompt_length)):
+            output = self(
+                input_ids=step_input,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                use_cache=use_cache,
+                cache=cache,
+                use_cache=config.use_cache,
+                num_logits_to_keep=1,
+            )
+            cache = output.cache
+            next_token = select_next_token(
+                output.logits[:, -1], config, generated, generator
             )
 
-            outputs = self.forward(**model_inputs)
-            next_token_logits = outputs["logits"][:, -1, :]
-            past_key_values = outputs["past_key_values"]
-            next_token_logits = next_token_logits / temperature
-
-            if repetition_penalty != 1.0:
-                for i in range(batch_size):
-                    for previous_token in generated_tokens[i]:
-                        if previous_token in [pad_token_id, eos_token_id]:
-                            continue
-
-                        next_token_logits[i, previous_token] /= repetition_penalty
-
-            if top_k > 0:
-                top_k_values, top_k_indices = torch.topk(next_token_logits, top_k)
-                next_token_logits = torch.full_like(next_token_logits, float("-inf"))
-                next_token_logits.scatter_(1, top_k_indices, top_k_values)
-
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(
-                    next_token_logits, descending=True
-                )
-                cumulative_probs = torch.cumsum(
-                    F.softmax(sorted_logits, dim=-1), dim=-1
-                )
-
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                    ..., :-1
-                ].clone()
-                sorted_indices_to_remove[..., 0] = 0
-
-                for i in range(batch_size):
-                    indices_to_remove = sorted_indices[i][sorted_indices_to_remove[i]]
-                    next_token_logits[i, indices_to_remove] = float("-inf")
-
-            if do_sample:
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-
-            else:
-                next_tokens = torch.argmax(next_token_logits, dim=-1)
-
-            if eos_token_id is not None:
-                next_tokens = next_tokens * unfinished_sequences + eos_token_id * (
-                    1 - unfinished_sequences
-                )
-
-            generated_tokens = torch.cat(
-                [generated_tokens, next_tokens.unsqueeze(-1)], dim=-1
+            # Finished rows emit padding, not a fresh sample.
+            next_token = torch.where(
+                unfinished, next_token, torch.full_like(next_token, pad_token_id)
             )
-
-            if eos_token_id is not None:
-                unfinished_sequences = unfinished_sequences.mul(
-                    (next_tokens != eos_token_id).long()
-                )
+            generated = torch.cat([generated, next_token[:, None]], dim=1)
 
             if streamer is not None:
-                streamer.put(next_tokens.unsqueeze(-1))
+                streamer.put(next_token[:, None])
 
-            if unfinished_sequences.max() == 0 or (
-                early_stopping and current_length > input_ids_seq_length + 50
-            ):
+            if stop_ids.numel():
+                unfinished &= ~torch.isin(next_token, stop_ids)
+            if not unfinished.any():
                 break
+
+            attention_mask = torch.cat([attention_mask, unfinished.long()[:, None]], dim=1)
+            position_ids = position_ids[:, -1:] + 1
+            step_input = next_token[:, None]
+
+            if not config.use_cache:
+                step_input = generated
+                position_ids = (attention_mask.long().cumsum(-1) - 1).clamp_min(0)
 
         if streamer is not None:
             streamer.end()
+        if was_training:
+            self.train()
+        return generated
 
-        return generated_tokens
+    # --- persistence ---
+
+    def save_pretrained(self, path: str | os.PathLike, safe: bool = True) -> None:
+        """Write config + weights. Prefers safetensors; falls back to ``torch.save``."""
+        os.makedirs(path, exist_ok=True)
+        self.config.save_pretrained(path)
+
+        state_dict = self.state_dict()
+        if self.config.tie_word_embeddings:
+            state_dict.pop("lm_head.weight", None)
+
+        if safe:
+            try:
+                from safetensors.torch import save_file
+
+                save_file(
+                    {k: v.contiguous() for k, v in state_dict.items()},
+                    os.path.join(path, "model.safetensors"),
+                    metadata={"format": "pt"},
+                )
+                return
+            except ImportError:
+                pass
+        torch.save(state_dict, os.path.join(path, "pytorch_model.bin"))
+
+    @classmethod
+    def from_pretrained(
+        cls, path: str | os.PathLike, device=None, dtype=None, strict: bool = True
+    ) -> AvaForCausalLM:
+        config = AvaConfig.from_pretrained(path)
+        model = cls(config)
+
+        safe_path = os.path.join(path, "model.safetensors")
+        bin_path = os.path.join(path, "pytorch_model.bin")
+        if os.path.isfile(safe_path):
+            from safetensors.torch import load_file
+
+            state_dict = load_file(safe_path)
+        elif os.path.isfile(bin_path):
+            state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
+        else:
+            raise FileNotFoundError(f"No model weights found in {path}.")
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        missing = [
+            k for k in missing if k != "lm_head.weight" or not config.tie_word_embeddings
+        ]
+        if strict and (missing or unexpected):
+            raise RuntimeError(
+                f"Checkpoint does not match the model.\n"
+                f"  missing: {missing}\n  unexpected: {unexpected}"
+            )
+
+        if dtype is not None:
+            model = model.to(dtype)
+        if device is not None:
+            model = model.to(device)
+        return model
+
+    @classmethod
+    def from_preset(cls, name: str, **overrides) -> AvaForCausalLM:
+        return cls(AvaConfig.from_preset(name, **overrides))
