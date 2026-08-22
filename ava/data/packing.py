@@ -95,28 +95,48 @@ def pack_corpus(
         handle.write(array.tobytes())
         return array.size
 
-    with open(output_path, "wb") as handle:
-        for document in documents:
-            buffer.append(document)
-            num_documents += 1
-            if len(buffer) >= batch_size:
-                num_tokens += flush(handle, buffer)
-                buffer.clear()
-                if verbose and num_tokens and num_tokens % report_every < batch_size:
-                    print(f"  {num_documents:,} docs -> {num_tokens:,} tokens")
-        num_tokens += flush(handle, buffer)
-
-    corpus = PackedCorpus(
-        path=output_path,
-        num_tokens=num_tokens,
-        dtype=dtype.name,
-        vocab_size=len(tokenizer),
-        num_documents=num_documents,
-    )
-
     meta_path = os.path.join(os.path.dirname(output_path) or ".", HEADER_FILENAME)
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(corpus.to_dict(), f, indent=2)
+
+    def describe() -> PackedCorpus:
+        return PackedCorpus(
+            path=output_path,
+            num_tokens=num_tokens,
+            dtype=dtype.name,
+            vocab_size=len(tokenizer),
+            num_documents=num_documents,
+        )
+
+    def write_meta() -> None:
+        """Keep the sidecar in step with the .bin, not just at the end.
+
+        Packing a real corpus takes hours and streams from a remote host that
+        drops connections. Writing the metadata only on success means an
+        interruption leaves a large .bin that nothing can read -- the token
+        dtype is not recoverable from the bytes -- and the whole run has to be
+        repeated. Rewriting a few hundred bytes periodically makes any
+        interruption leave a smaller but perfectly usable dataset.
+        """
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(describe().to_dict(), f, indent=2)
+
+    try:
+        with open(output_path, "wb") as handle:
+            for document in documents:
+                buffer.append(document)
+                num_documents += 1
+                if len(buffer) >= batch_size:
+                    num_tokens += flush(handle, buffer)
+                    buffer.clear()
+                    if num_tokens and num_tokens % report_every < batch_size:
+                        handle.flush()
+                        write_meta()
+                        if verbose:
+                            print(f"  {num_documents:,} docs -> {num_tokens:,} tokens")
+            num_tokens += flush(handle, buffer)
+    finally:
+        write_meta()
+
+    corpus = describe()
 
     if verbose:
         size_mb = os.path.getsize(output_path) / 1e6

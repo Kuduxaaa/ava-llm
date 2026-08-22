@@ -74,6 +74,31 @@ def test_dtype_widens_for_large_vocabularies(tmp_path, tokenizer):
     assert tokens.dtype == np.uint32
 
 
+def test_an_interrupted_pack_still_leaves_a_usable_dataset(tmp_path, tokenizer):
+    """Packing streams for hours from a host that drops connections.
+
+    Writing the sidecar only on success leaves a large .bin that nothing can
+    read -- the dtype is not recoverable from the bytes -- and the whole run has
+    to be repeated.
+    """
+
+    def documents():
+        for index in range(10_000):
+            yield f"document number {index} with some words in it"
+            if index == 3_000:
+                raise ConnectionError("remote host went away")
+
+    with pytest.raises(ConnectionError):
+        pack_corpus(
+            documents(), tokenizer, tmp_path / "c.bin", verbose=False, report_every=1000
+        )
+
+    tokens, corpus = load_packed(tmp_path / "c.bin")
+    assert corpus.num_tokens > 0
+    assert tokens.size >= corpus.num_tokens
+    assert PackedDataset(tmp_path / "c.bin", block_size=64)[0]["input_ids"].shape == (64,)
+
+
 def test_missing_metadata_is_an_explicit_error(tmp_path, tokenizer):
     pack_corpus(["a b c"], tokenizer, tmp_path / "c.bin", verbose=False)
     (tmp_path / "meta.json").unlink()
