@@ -314,6 +314,7 @@ class AvaTokenizer:
         max_sentence_length: int = 16384,
         num_threads: int = os.cpu_count() or 4,
         byte_fallback: bool = True,
+        input_sentence_size: int = 2_000_000,
         **trainer_kwargs: Any,
     ) -> AvaTokenizer:
         """Train a SentencePiece model and return the loaded tokenizer.
@@ -328,6 +329,13 @@ class AvaTokenizer:
         ever unrecoverable. Those pieces come out of ``vocab_size``, which is
         why a byte-fallback tokenizer needs a few hundred slots before it can
         hold a single merge.
+
+        ``input_sentence_size`` caps how many sentences the trainer holds in
+        memory, sampling uniformly across the file. SentencePiece otherwise
+        loads the *entire* corpus, which is fine for a few hundred megabytes and
+        fatal for the tens of gigabytes a real pretraining corpus runs to. Two
+        million sentences is far more than a 32k vocabulary can use; raising it
+        buys nothing but RAM.
         """
         if byte_fallback and vocab_size < MIN_BYTE_FALLBACK_VOCAB:
             raise ValueError(
@@ -361,6 +369,8 @@ class AvaTokenizer:
                 eos_piece="</s>",
                 unk_piece="<unk>",
                 byte_fallback=byte_fallback,
+                input_sentence_size=input_sentence_size,
+                shuffle_input_sentence=True,
                 train_extremely_large_corpus=vocab_size > 64000,
                 **trainer_kwargs,
             )

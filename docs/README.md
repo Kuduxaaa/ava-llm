@@ -5,6 +5,7 @@
 | [architecture.md](architecture.md) | Transformer, Mamba and hybrid stacks; the cache; stability |
 | [configuration.md](configuration.md) | Every `AvaConfig` field, presets, sizing a model |
 | [training.md](training.md) | Precision, optimizers, schedules, memory, DDP, resume |
+| [pretraining.md](pretraining.md) | Runbook for the first real job: measured costs, sequence, gotchas |
 | [data.md](data.md) | Corpus packing, chat data, collators |
 | [tokenizer.md](tokenizer.md) | Training a tokenizer for any language |
 | [generation.md](generation.md) | Sampling, caching, LoRA, quantisation |
@@ -57,7 +58,7 @@ ava/
   tokenizer.py        SentencePiece wrapper
   utils/              distributed setup, summaries, seeding
 
-scripts/          download_corpus, prepare_data, pretrain, generate, world_demo
+scripts/          preflight, download_corpus, prepare_data, pretrain, generate, world_demo
 tests/            pytest suite
 ```
 

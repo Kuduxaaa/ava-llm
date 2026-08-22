@@ -87,6 +87,9 @@ input → embed → [MambaBlock × 10] → [DecoderLayer × 2] → RMSNorm → l
 ## Quick start
 
 ```bash
+# 0. Check the pipeline end to end, in about a minute
+python scripts/preflight.py
+
 # 1. Get a corpus (any Hub dataset, any language)
 python scripts/download_corpus.py --dataset HuggingFaceFW/fineweb \
     --config sample-10BT --max-docs 500000
@@ -223,6 +226,7 @@ nothing else notices.
 - [Architecture](docs/architecture.md) — transformer, Mamba, hybrid, and the cache
 - [Configuration](docs/configuration.md) — every `AvaConfig` field
 - [Training](docs/training.md) — precision, optimizers, schedules, scaling, memory
+- [Pretraining runbook](docs/pretraining.md) — measured throughput, cloud costs, the actual sequence
 - [Data](docs/data.md) — packing, chat data, collators
 - [Tokenizer](docs/tokenizer.md) — training one for any language
 - [Generation](docs/generation.md) — sampling, caching, LoRA, quantisation

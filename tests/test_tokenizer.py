@@ -41,6 +41,24 @@ def test_vocab_too_small_for_byte_fallback_is_a_clear_error(tmp_path, corpus):
         AvaTokenizer.train(corpus, tmp_path, vocab_size=200)
 
 
+def test_training_samples_rather_than_loading_the_whole_corpus(tmp_path, corpus):
+    """SentencePiece loads every sentence into RAM unless told not to.
+
+    Fine for a few hundred megabytes, fatal for the tens of gigabytes a real
+    pretraining corpus runs to -- and the failure arrives after the download,
+    on a rented machine.
+    """
+    tokenizer = AvaTokenizer.train(
+        corpus,
+        tmp_path,
+        vocab_size=512,
+        character_coverage=1.0,
+        input_sentence_size=500,
+    )
+    assert len(tokenizer) == 512
+    assert tokenizer.decode(tokenizer.encode("abc bcd")) == "abc bcd"
+
+
 def test_vocab_too_large_for_the_corpus_is_a_clear_error(tmp_path, corpus):
     with pytest.raises(ValueError, match="larger than this corpus can support"):
         AvaTokenizer.train(corpus, tmp_path, vocab_size=50_000)
