@@ -303,6 +303,54 @@ def test_a_time_budget_stops_cleanly_and_leaves_a_checkpoint(tmp_path, loader):
     assert any(f.startswith("ava_step_") for f in os.listdir(tmp_path))
 
 
+def test_max_steps_keeps_going_past_the_end_of_the_data(tmp_path):
+    """A step budget larger than the corpus must repeat it, not stop early.
+
+    Stopping at the end of one pass delivers a fraction of the requested
+    training and reports success -- which is how a small corpus quietly halves
+    a run, and it is invisible on a corpus large enough to never reach the end.
+    """
+    from ava.training.trainer import Trainer
+
+    data = RandomTokens(size=8, length=16)
+    loader = DataLoader(data, batch_size=4)  # 2 steps per pass
+    trainer = Trainer(
+        AvaForCausalLM(tiny()),
+        loader,
+        config=TrainingConfig(
+            num_epochs=1,
+            max_steps=9,
+            precision="fp32",
+            checkpoint_dir=str(tmp_path),
+            log_interval=1000,
+        ),
+    )
+    trainer.train()
+
+    assert trainer.global_step >= 9, (
+        f"asked for 9 steps over a 2-step corpus, got {trainer.global_step}"
+    )
+    assert trainer.finished
+
+
+def test_without_max_steps_epochs_still_bound_the_run(tmp_path):
+    from ava.training.trainer import Trainer
+
+    loader = DataLoader(RandomTokens(size=8, length=16), batch_size=4)
+    trainer = Trainer(
+        AvaForCausalLM(tiny()),
+        loader,
+        config=TrainingConfig(
+            num_epochs=3,
+            precision="fp32",
+            checkpoint_dir=str(tmp_path),
+            log_interval=1000,
+        ),
+    )
+    trainer.train()
+    assert trainer.global_step == 6  # 2 steps per pass, three passes
+
+
 def test_max_steps_overrides_epochs(tmp_path, loader):
     from ava.training.trainer import Trainer
 

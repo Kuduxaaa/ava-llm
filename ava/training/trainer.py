@@ -148,7 +148,11 @@ class TrainingConfig:
     num_epochs: int = 1
     max_steps: int | None = None
     """Optimizer steps. Takes precedence over ``num_epochs`` when set -- which is
-    what you want for pretraining, where "an epoch" is not a meaningful unit."""
+    what you want for pretraining, where "an epoch" is not a meaningful unit.
+
+    When it asks for more steps than the corpus holds, the data is repeated.
+    That is normal for a language without a large corpus, where the alternative
+    is a model far below the size the available compute could support."""
 
     learning_rate: float = 3e-4
     min_lr_ratio: float = 0.1
@@ -319,7 +323,22 @@ class Trainer:
             f"world_size={self.world_size} compile={cfg.compile_model}"
         )
         if tokens_per_step:
+            total = tokens_per_step * self.num_training_steps
             self.log(f"tokens/optimizer-step: {tokens_per_step:,}")
+
+            steps_per_pass = len(self.train_loader) // accum
+            if steps_per_pass:
+                passes = self.num_training_steps / steps_per_pass
+                corpus = steps_per_pass * tokens_per_step
+                self.log(
+                    f"budget: {total:,} tokens over a {corpus:,}-token corpus "
+                    f"= {passes:.1f} pass(es)"
+                )
+                if passes > 4:
+                    self.log(
+                        f"  note: {passes:.1f} passes is a lot of repetition. "
+                        "Consider more data or a smaller model."
+                    )
 
         self.model.train()
         for optimizer in self.optimizers:
@@ -333,7 +352,8 @@ class Trainer:
         is_step_boundary = True
         deadline = None if cfg.max_hours is None else start_time + cfg.max_hours * 3600.0
 
-        for epoch in range(self.start_epoch, cfg.num_epochs):
+        epoch = self.start_epoch
+        while True:
             sampler = getattr(self.train_loader, "sampler", None)
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
@@ -393,7 +413,19 @@ class Trainer:
                 self.save_checkpoint(f"epoch_{epoch + 1}", epoch)
             if self.val_loader is not None:
                 self._run_validation(epoch)
+
+            epoch += 1
             if stop:
+                break
+            if cfg.max_steps is not None:
+                # The step budget governs, so keep going over the data until it
+                # is spent. Stopping at the end of one pass would silently
+                # deliver a fraction of the requested training and report
+                # success -- which is how a small corpus quietly halves a run.
+                if self.global_step >= self.num_training_steps:
+                    break
+                self.log(f"pass {epoch + 1} over the corpus (step {self.global_step})")
+            elif epoch >= cfg.num_epochs:
                 break
 
         elapsed = time.time() - start_time
