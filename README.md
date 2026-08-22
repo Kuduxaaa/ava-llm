@@ -72,6 +72,15 @@ input → embed → [MambaBlock × 10] → [DecoderLayer × 2] → RMSNorm → l
 - top-k, top-p, min-p, repetition penalty, n-gram blocking
 - LoRA with merge-back, and int8 / int4 weight-only quantisation
 
+**Internal world** — a persistent simulated organism, in tensors
+- 136 coupled channels: biochemistry, physiology, drives, emotion, cognition
+- Time constants from two minutes to a month, asymmetric rise and fall
+- Circadian rhythm, sleep pressure, hunger, rumination, isolation — running
+  whether or not anyone is talking
+- Appraisal conditioned on the world, so identical words are not identical events
+- Personality as a standing bias; per-person bonds with their own clocks
+- Reaches the model by modulating the residual stream, not by narration
+
 ---
 
 ## Quick start
@@ -125,6 +134,28 @@ model, history = train_model(
     ),
 )
 model.save_pretrained("checkpoints/final")
+```
+
+### The internal world
+
+```python
+from ava.world import WorldEngine, Personality
+
+engine = WorldEngine(personality=Personality(neuroticism=0.7))
+
+engine.observe({"loss": 0.9, "psychological_threat": 0.7}, dt=45, person="nika")
+engine.idle(1800)          # half an hour later, still not fine
+print(engine.summary())
+print(engine.why("internal_state.stress"))
+
+output = model(input_ids=ids, world_state=engine.state)
+```
+
+Emotion is an output here, not an input: nothing writes to `emotion.sadness`.
+See [docs/world.md](docs/world.md), or watch it run:
+
+```bash
+python scripts/world_demo.py --scenario job --personality anxious --explain
 ```
 
 ### Generating
@@ -194,6 +225,7 @@ nothing else notices.
 - [Data](docs/data.md) — packing, chat data, collators
 - [Tokenizer](docs/tokenizer.md) — training one for any language
 - [Generation](docs/generation.md) — sampling, caching, LoRA, quantisation
+- [World](docs/world.md) — the internal world engine
 
 ## References
 

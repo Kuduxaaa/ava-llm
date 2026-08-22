@@ -76,6 +76,17 @@ class AvaConfig:
     num_attention_layers: int = 2
     """Hybrid only: how many trailing layers are attention rather than Mamba."""
 
+    # --- internal world ---
+    world_conditioning: bool = False
+    """Let :mod:`ava.world` modulate the residual stream. Off by default; a
+    model trained without it must not silently acquire it."""
+    world_conditioning_layers: tuple[int, ...] | None = None
+    """Which layers to modulate. ``None`` means all of them."""
+    world_conditioning_width: int = 128
+    world_prefix_tokens: int = 0
+    """Soft prompt length derived from the world state. 0 disables it."""
+    world_conditioning_scale: float = 0.1
+
     # --- runtime ---
     use_cache: bool = True
     gradient_checkpointing: bool = False

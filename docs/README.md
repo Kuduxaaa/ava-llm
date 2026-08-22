@@ -8,6 +8,7 @@
 | [data.md](data.md) | Corpus packing, chat data, collators |
 | [tokenizer.md](tokenizer.md) | Training a tokenizer for any language |
 | [generation.md](generation.md) | Sampling, caching, LoRA, quantisation |
+| [world.md](world.md) | The internal world: 136 coupled channels on their own clocks |
 
 ## Where to start
 
@@ -35,6 +36,16 @@ ava/
     ava_model.py      the stack, the LM head, generate(), persistence
     lora.py           adapters
     quantization.py   int8 / int4 weight-only
+  world/
+    schema.py         the 136 channels, baselines, time constants
+    coupling.py       ~220 edges: what drives what
+    dynamics.py       the integrator
+    clock.py          absolute time, circadian and homeostatic drives
+    personality.py    traits as baseline and tau shifts
+    appraisal.py      event -> meaning, expectation, prediction error
+    relationships.py  per-person bonds
+    conditioning.py   FiLM and soft prefix into the model
+    engine.py         the loop that ties it together
   data/
     packing.py        corpus -> memory-mapped token stream
     datasets.py       PackedDataset, ChatDataset, collators
@@ -45,7 +56,7 @@ ava/
   tokenizer.py        SentencePiece wrapper
   utils/              distributed setup, summaries, seeding
 
-scripts/          download_corpus, prepare_data, pretrain, generate
+scripts/          download_corpus, prepare_data, pretrain, generate, world_demo
 tests/            pytest suite
 ```
 

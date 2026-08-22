@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from ..config import AvaConfig
+from ..world.conditioning import WorldConditioner, apply_film
 from .attention import AvaAttention, build_causal_mask
 from .cache import AvaCache
 from .embeddings import AvaRotaryEmbedding
@@ -128,6 +129,7 @@ class AvaModel(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
+        world_modulation: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> BaseModelOutput:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Pass exactly one of input_ids or inputs_embeds.")
@@ -185,6 +187,9 @@ class AvaModel(nn.Module):
                     output_attentions=output_attentions,
                 )
 
+            if world_modulation is not None and index in world_modulation:
+                hidden_states = apply_film(hidden_states, world_modulation[index])
+
             if output_attentions and attn_weights is not None:
                 all_attentions.append(attn_weights)
 
@@ -214,6 +219,22 @@ class AvaForCausalLM(nn.Module):
 
         self.apply(self._init_weights)
         self._scale_residual_projections()
+
+        # Built after the global init pass, not before. The conditioner's FiLM
+        # heads are deliberately zeroed so an untrained conditioner is exactly a
+        # no-op, and _init_weights would overwrite that with a normal.
+        self.world_conditioner = (
+            WorldConditioner(
+                hidden_size=config.hidden_size,
+                num_layers=config.num_hidden_layers,
+                conditioning_layers=config.world_conditioning_layers,
+                width=config.world_conditioning_width,
+                num_prefix_tokens=config.world_prefix_tokens,
+                scale=config.world_conditioning_scale,
+            )
+            if config.world_conditioning
+            else None
+        )
 
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -329,6 +350,7 @@ class AvaForCausalLM(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         num_logits_to_keep: int = 0,
+        world_state=None,
     ) -> CausalLMOutput:
         """``num_logits_to_keep=1`` computes logits for the last position only.
 
@@ -336,6 +358,15 @@ class AvaForCausalLM(nn.Module):
         is a ``hidden_size x vocab_size`` matmul -- skipping it is the single
         biggest saving in the decode loop for a small model with a large vocab.
         """
+        world_modulation = None
+        if world_state is not None:
+            if self.world_conditioner is None:
+                raise ValueError(
+                    "This model was built without world conditioning. Set "
+                    "AvaConfig(world_conditioning=True) to attach a conditioner."
+                )
+            world_modulation = self.world_conditioner(world_state)
+
         output = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -345,6 +376,7 @@ class AvaForCausalLM(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            world_modulation=world_modulation,
         )
 
         hidden_states = output.last_hidden_state
