@@ -64,6 +64,18 @@ def test_vocab_too_large_for_the_corpus_is_a_clear_error(tmp_path, corpus):
         AvaTokenizer.train(corpus, tmp_path, vocab_size=50_000)
 
 
+def test_training_is_quiet_by_default(tmp_path, corpus, capfd):
+    """SentencePiece prints a line per merge; a real vocabulary is thousands.
+
+    Hosted notebooks cap output size, and exceeding it can stop the notebook
+    saving at all -- losing the session's work to a log.
+    """
+    capfd.readouterr()
+    AvaTokenizer.train(corpus, tmp_path, vocab_size=512, character_coverage=1.0)
+    captured = capfd.readouterr()
+    assert "Adding meta_piece" not in captured.err + captured.out
+
+
 def test_special_token_ids_are_pinned(tokenizer):
     assert (tokenizer.pad_token_id, tokenizer.bos_token_id) == (0, 1)
     assert (tokenizer.eos_token_id, tokenizer.unk_token_id) == (2, 3)

@@ -315,6 +315,7 @@ class AvaTokenizer:
         num_threads: int = os.cpu_count() or 4,
         byte_fallback: bool = True,
         input_sentence_size: int = 2_000_000,
+        quiet: bool = True,
         **trainer_kwargs: Any,
     ) -> AvaTokenizer:
         """Train a SentencePiece model and return the loaded tokenizer.
@@ -329,6 +330,11 @@ class AvaTokenizer:
         ever unrecoverable. Those pieces come out of ``vocab_size``, which is
         why a byte-fallback tokenizer needs a few hundred slots before it can
         hold a single merge.
+
+        ``quiet`` suppresses SentencePiece's own logging, which prints a line per
+        merge and per byte-fallback piece -- thousands of them for a real
+        vocabulary. Hosted notebooks cap their output size, and exceeding it can
+        stop the notebook saving at all.
 
         ``input_sentence_size`` caps how many sentences the trainer holds in
         memory, sampling uniformly across the file. SentencePiece otherwise
@@ -371,6 +377,7 @@ class AvaTokenizer:
                 byte_fallback=byte_fallback,
                 input_sentence_size=input_sentence_size,
                 shuffle_input_sentence=True,
+                minloglevel=2 if quiet else 0,
                 train_extremely_large_corpus=vocab_size > 64000,
                 **trainer_kwargs,
             )
