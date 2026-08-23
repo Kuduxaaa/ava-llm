@@ -274,6 +274,7 @@ class Trainer:
         self.global_step = 0
         self.start_epoch = 0
         self.finished = False
+        self._uploaded_step = -1
         self.best_val_loss = float("inf")
         self.history: list[dict[str, Any]] = []
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
@@ -587,6 +588,11 @@ class Trainer:
         repo = self.config.hub_repo
         if not repo:
             return
+        if self._uploaded_step == self.global_step:
+            # A validation "best" save and a periodic step save can land on the
+            # same step, and both would push the same weights to the same path.
+            return
+        self._uploaded_step = self.global_step
         try:
             from huggingface_hub import HfApi
 

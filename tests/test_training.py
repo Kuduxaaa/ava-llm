@@ -400,6 +400,48 @@ def test_uploads_are_less_frequent_than_saves_by_default(tmp_path, loader):
     assert saves >= 1
 
 
+def test_one_upload_per_step_even_when_two_saves_land_on_it(tmp_path, loader):
+    """A validation "best" save and a periodic step save can coincide.
+
+    Both write the same weights to the same remote path, so the second is pure
+    waste on a connection that is already the slow part of the loop.
+    """
+    from unittest.mock import patch as mock_patch
+
+    from ava.training.trainer import Trainer
+
+    trainer = Trainer(
+        AvaForCausalLM(tiny()),
+        loader,
+        DataLoader(RandomTokens(size=8, length=16), batch_size=4),
+        config=TrainingConfig(
+            num_epochs=1,
+            max_steps=4,
+            precision="fp32",
+            checkpoint_dir=str(tmp_path),
+            save_every=2,
+            eval_every=2,
+            hub_repo="someone/ava",
+            hub_every=2,
+            log_interval=1000,
+        ),
+    )
+
+    steps: list[int] = []
+
+    def record(self, path):
+        if self._uploaded_step == self.global_step:
+            return
+        self._uploaded_step = self.global_step
+        steps.append(self.global_step)
+
+    with mock_patch.object(Trainer, "_upload_checkpoint", record):
+        trainer.train()
+
+    assert steps, "nothing was uploaded at all"
+    assert len(steps) == len(set(steps)), f"uploaded twice on one step: {steps}"
+
+
 def test_no_hub_repo_means_no_upload(tmp_path, loader):
     from unittest.mock import patch as mock_patch
 
