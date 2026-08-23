@@ -325,7 +325,7 @@ class Trainer:
         accum = cfg.gradient_accumulation_steps
 
         tokens_per_step = self._tokens_per_optimizer_step()
-        meter = ThroughputMeter(self.model_config, self.device)
+        meter = ThroughputMeter(self.model_config, self.device, world_size=self.world_size)
 
         if cfg.hub_repo:
             self.log(f"mirroring checkpoints to {cfg.hub_repo}")

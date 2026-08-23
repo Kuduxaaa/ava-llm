@@ -60,11 +60,18 @@ class ThroughputMeter:
         device: torch.device,
         window: float = 30.0,
         seq_len: int | None = None,
+        world_size: int = 1,
     ) -> None:
         self.config = config
         self.device = device
         self.window = window
-        self.peak_flops = device_peak_flops(device)
+        self.world_size = max(1, world_size)
+        # The token count fed in is summed across ranks, so the ceiling it is
+        # measured against has to be too. Comparing every GPU's output to one
+        # GPU's peak reports a utilisation that is world_size times too good --
+        # and 32% is a number you act on, while 16% is one you investigate.
+        peak = device_peak_flops(device)
+        self.peak_flops = None if peak is None else peak * self.world_size
         # The sequence length actually being trained on, which is often well
         # below max_position_embeddings. Using the latter instead inflates the
         # attention term and reports an MFU that is too good.

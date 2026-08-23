@@ -469,6 +469,23 @@ def test_throughput_meter_uses_the_actual_sequence_length():
     assert ThroughputMeter(config, torch.device("cpu")).seq_len == 8192
 
 
+def test_mfu_is_measured_against_every_gpu_not_one():
+    """Tokens are summed across ranks, so the ceiling has to be summed too.
+
+    Otherwise utilisation reads world_size times too good -- and 32% is a number
+    you act on, while 16% is one you investigate.
+    """
+    from unittest.mock import patch as mock_patch
+
+    config = tiny()
+    device = torch.device("cuda")
+    with mock_patch("ava.training.metrics.device_peak_flops", return_value=65e12):
+        one = ThroughputMeter(config, device, seq_len=512, world_size=1)
+        two = ThroughputMeter(config, device, seq_len=512, world_size=2)
+
+    assert two.peak_flops == 2 * one.peak_flops
+
+
 def test_wrap_ddp_is_a_no_op_without_a_process_group():
     from ava.utils import wrap_ddp
 
